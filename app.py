@@ -53,6 +53,10 @@ BINANCE_REV = {v: k for k, v in CRYPTO.items()}
 BINANCE_HOSTS = ["wss://stream.binance.com:9443", "wss://stream.binance.us:9443"]
 BINANCE_REST = ["https://api.binance.us", "https://api.binance.com"]   # .US first: .com is often geo-blocked
 HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; TradingDesk/4.0)"}
+# Alpaca paper/live keys (optional) — stock quotes prefer Alpaca when set
+ALPACA_KEY = os.getenv("ALPACA_API_KEY", "").strip()
+ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY", "").strip()
+ALPACA_DATA = "https://data.alpaca.markets"
 
 # ---- paper account & risk configuration ----
 INITIAL_CASH = float(os.getenv("START_CASH", "10000"))
@@ -344,13 +348,42 @@ def series_5m(symbol):
     return try_sources(src, 30, SERIES_ERR, symbol)[1]
 
 
+def alpaca_enabled():
+    return bool(ALPACA_KEY and ALPACA_SECRET)
+
+
+def alpaca_snapshot_price(symbol):
+    """Latest trade price from Alpaca market data (IEX on free/paper). Returns (ts, price)."""
+    url = f"{ALPACA_DATA}/v2/stocks/{symbol}/snapshot?feed=iex"
+    req = urllib.request.Request(url, headers={
+        "APCA-API-KEY-ID": ALPACA_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET,
+        "Accept": "application/json",
+    })
+    with urllib.request.urlopen(req, timeout=8) as r:
+        j = json.loads(r.read().decode())
+    # prefer latest trade, else midpoint of quote
+    lt = (j.get("latestTrade") or {}).get("p")
+    if lt is not None:
+        return time.time(), float(lt)
+    q = j.get("latestQuote") or {}
+    bp, ap = q.get("bp"), q.get("ap")
+    if bp and ap and bp > 0 and ap > 0:
+        return time.time(), (float(bp) + float(ap)) / 2
+    raise RuntimeError("Alpaca snapshot has no price")
+
+
 def latest_price(symbol):
     src = []
     if symbol in CRYPTO:
         src.append(("Binance REST", lambda: [(time.time(), binance_last(symbol)[0])]))
-    src += [("Yahoo Finance · 1m", lambda: yahoo_chart(symbol, "1m", "1d")),
-            ("Yahoo Finance · 5m", lambda: yahoo_chart(symbol, "5m", "5d")),
-            ("yfinance · 1m", lambda: yf_series(symbol, "1m", "5d"))]
+    else:
+        # Stocks: Alpaca first when keys are set, then Yahoo fallbacks
+        if alpaca_enabled():
+            src.append(("Alpaca · IEX", lambda: [alpaca_snapshot_price(symbol)]))
+        src += [("Yahoo Finance · 1m", lambda: yahoo_chart(symbol, "1m", "1d")),
+                ("Yahoo Finance · 5m", lambda: yahoo_chart(symbol, "5m", "5d")),
+                ("yfinance · 1m", lambda: yf_series(symbol, "1m", "5d"))]
     name, pts = try_sources(src, 1, PRICE_ERR, symbol)
     return (name, pts[-1][0], pts[-1][1]) if pts else None
 
@@ -384,7 +417,13 @@ def _refresh_one_price(s):
     if s in CRYPTO and q and q["source"].startswith("Binance WebSocket") and q["age"] < WS_FRESH_SEC:
         return  # WebSocket is healthy
     live = bool(q and q["status"] == "live")
-    wait = (PRICE_LOOP_SEC if s in CRYPTO else 60) if live else (60 if s in CRYPTO else 300)
+    # Stocks with Alpaca can refresh more often; Yahoo stays conservative
+    if s in CRYPTO:
+        wait = PRICE_LOOP_SEC if live else 60
+    elif alpaca_enabled():
+        wait = 15 if live else 60
+    else:
+        wait = 60 if live else 300
     if time.time() - LAST_TRY.get(s, 0) < wait - 1:
         return
     LAST_TRY[s] = time.time()
@@ -1288,8 +1327,9 @@ def pipeline_loop():
     STOP.wait(4)  # let the first prices arrive
     # One-time desk intro for practical defaults
     lp0 = live_params()
+    data_note = "หุ้นใช้ Alpaca IEX" if alpaca_enabled() else "หุ้นใช้ Yahoo (หน่วง)"
     say("Chief", f"ทีมพร้อม · โหมดเริ่มต้น {lp0['label']} · Auto ยังปิดอยู่จนกว่าจะเปิดเอง · "
-        f"Scout/News/Sentiment/Charts/Skeptic ทำงานตามหน้าที่ · Risk ตั้ง stop ก่อนเข้าทุกครั้ง", tone="ok")
+        f"{data_note} · Scout/News/Sentiment/Charts/Skeptic ตามหน้าที่ · Risk ตั้ง stop ก่อนเข้า", tone="ok")
     while not STOP.is_set():
         _safe(run_cycle)
         lp = live_params()

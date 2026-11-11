@@ -3,7 +3,7 @@ const money = n => "$" + Number(n || 0).toLocaleString("en-US", {minimumFraction
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
 const pct = n => (n >= 0 ? "+" : "") + (n * 100).toFixed(2) + "%";
 let KEY = localStorage.getItem("appkey") || "";
-let SEEN = null, CHATLAST = 0, ACCOUNT = null, PRICES = {}, PICK = null, busy = false, asking = null, tick = 0;
+let toneTick = 0, SEEN = null, CHATLAST = 0, ACCOUNT = null, PRICES = {}, PICK = null, busy = false, asking = null, tick = 0;
 
 function toast(msg, kind = "info") {
   const t = $("toast");
@@ -82,6 +82,27 @@ function renderDesk(d) {
     CHATLAST = last;
   }
   $("floorage").textContent = d.bots.filter(x => x.state === "online").length + " online · รอบ " + d.cycle;
+}
+
+function renderFilings(d) {
+  $("filings").innerHTML = d.filings.length ? "<small class=\"muted\">📄 SEC 8-K ล่าสุด (หุ้นที่บอทตรวจ)</small>" + d.filings.map(f => `
+    <div class="traderow"><b>${esc(f.symbol)}</b><span>${f.labels.map(esc).join(" · ") || "ไม่ระบุรายการ"}</span>
+    <span>${esc(f.date)} · <a href="${esc(f.url)}" target="_blank" rel="noopener">เปิดเอกสาร</a></span></div>`).join("")
+    : (d.sec_on ? "" : '<small class="muted">เปิดดู 8-K ได้โดยตั้ง SEC_CONTACT ใน Render (ชื่อ + อีเมลของคุณ ตามกติกาของ SEC)</small>');
+}
+
+function renderTone(d) {
+  renderFilings(d);
+  if (!d.items.length) return;
+  const W = 90, H = 24;
+  $("tone").innerHTML = d.items.map(x => {
+    const v = x.points, pts = v.length > 1 ? v.map((y, i) => `${(i / (v.length - 1) * W).toFixed(1)},${(H / 2 - y * (H / 2 - 2)).toFixed(1)}`).join(" ") : "";
+    const col = x.last >= 0.3 ? "#5be0b4" : x.last <= -0.3 ? "#ff8585" : "#f5c96a";
+    return `<div class="tonerow"><b>${esc(x.symbol)}</b>
+      <span>${x.topics.map(t => `<em class="tag">${esc(t)}</em>`).join("")}<small class="muted"> ${x.n} ข่าว</small></span>
+      <svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}"><line x1="0" x2="${W}" y1="${H / 2}" y2="${H / 2}" stroke="#24334b"/>${pts ? `<polyline fill="none" stroke="${col}" stroke-width="1.6" points="${pts}"/>` : ""}</svg>
+      <strong style="color:${col}">${(x.last >= 0 ? "+" : "") + x.last.toFixed(2)}</strong></div>`;
+  }).join("");
 }
 
 function fillCard(t) {
@@ -181,6 +202,7 @@ async function refresh(manual = false) {
     const [m, pl, a, b, dk, e] = await Promise.all(calls);
     renderMarket(m.items); renderPipeline(pl); renderAccount(a); renderBot(b); renderDesk(dk);
     if (e) spark(e.points);
+    if (manual || toneTick++ % 6 === 0) api("/api/newstone").then(renderTone).catch(() => {});
   } catch (err) { toast(err.message, "err"); }
   finally { busy = false; }
 }

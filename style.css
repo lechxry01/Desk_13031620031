@@ -15,3 +15,12 @@ button:disabled{opacity:.5;cursor:wait}
 .switch span{position:absolute;inset:0;background:#2a3b55;border-radius:26px;transition:.2s;cursor:pointer}
 .switch span:before{content:"";position:absolute;width:20px;height:20px;left:3px;top:3px;background:#e8eef8;border-radius:50%;transition:.2s}
 .switch input:checked+span{background:#1f9d7a}.switch input:checked+span:before{transform:translateX(20px)}
+.market{max-height:340px;overflow:auto}
+.flow{display:flex;align-items:center;gap:6px;margin:6px 0 10px}.flow span{color:#74869e}
+.chip{flex:1;background:#18283f;border:1px solid #28405f;border-radius:12px;padding:8px 4px;text-align:center}
+.chip b{display:block;font-size:20px}.chip small{display:block;font-size:11px;color:#9fb2cc}.chip em{display:block;font-size:10px;color:#74869e;font-style:normal}
+.prow,.deadbox{border-top:1px solid #1f3149;padding:8px 0}
+.prow summary,.deadbox summary{cursor:pointer;display:flex;justify-content:space-between;gap:8px;font-size:13px;list-style:none}
+.prow summary span{color:#9fb2cc;text-align:right}
+.pnote{font-size:12px;color:#9fb2cc;margin:6px 0}.rule{font-size:11.5px;color:#9fb2cc;padding:2px 0}
+.deadbox summary{color:#9fb2cc}.deadbox .prow{padding-left:8px}

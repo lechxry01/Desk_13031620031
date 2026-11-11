@@ -15,7 +15,7 @@
 <title>AI Trading Desk PRO</title>
 </head>
 <body>
-<header><div><small>SIMULATION ONLY · PHASE 3</small><h1>AI Trading Desk <b>PRO</b></h1></div><span class="live">● PAPER MODE</span></header>
+<header><div><small>SIMULATION ONLY · PHASE 4</small><h1>AI Trading Desk <b>PRO</b></h1></div><span class="live">● PAPER MODE</span></header>
 <div id="halt" class="banner" hidden>⚠ ขาดทุนสะสมเกินกรอบ — ระบบหยุดเปิดสถานะใหม่ (ปิดสถานะได้เท่านั้น)</div>
 <main>
 <section class="stats">
@@ -36,8 +36,10 @@
   <small class="muted">คริปโต: Binance WebSocket (สำรอง Yahoo) · หุ้น: Yahoo Finance อาจล่าช้า/ไม่เรียลไทม์</small>
 </section>
 <section class="panel">
-  <div class="heading"><h2>Live Signals</h2><span class="muted" id="sigage">Rule-based · ไม่ใช่คำแนะนำลงทุน</span></div>
-  <div id="signals"></div>
+  <div class="heading"><h2>Agent Pipeline</h2><span class="muted" id="pipeage">กำลังเริ่ม…</span></div>
+  <div id="pipeflow" class="flow"></div>
+  <small class="muted">Scout หาตัวเลือก → Filter ตัดตัวที่ไม่ผ่าน 6 กฎ → Analyst ให้คะแนน 0–1 (ต่ำกว่าเกณฑ์ถูกตัด) → Risk ตั้ง stop ก่อนเข้า → Executor ส่งคำสั่ง → Logger บันทึกทุกการตัดออก</small>
+  <div id="pipelist"></div>
 </section>
 <section class="panel">
   <h2>Paper Order</h2>

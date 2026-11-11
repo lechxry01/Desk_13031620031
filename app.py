@@ -57,8 +57,8 @@ HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; TradingDesk/4.0)"}
 # ---- paper account & risk configuration ----
 INITIAL_CASH = float(os.getenv("START_CASH", "10000"))
 FEE_RATE = 0.001
-MAX_TRADE_PCT = 0.10        # Executor: max 10% of equity per trade
-MAX_POSITION_PCT = 0.25     # Risk: one symbol may not exceed 25% of equity
+MAX_TRADE_PCT = 0.05        # Executor: max 5% of equity per trade (practical — losers hurt less)
+MAX_POSITION_PCT = 0.20     # Risk: one symbol may not exceed 20% of equity
 STOP_LOSS_PCT = 0.08        # Risk: stop set at -8% BEFORE entry
 TRAIL_ACTIVATE_PCT = 0.15   # Risk: trailing starts once a position is +15%
 TRAIL_PCT = 0.08            # trailing stop sits 8% below the peak
@@ -92,6 +92,29 @@ PRICE_LOOP_SEC = 30
 PIPELINE_SEC = 120
 SNAPSHOT_SEC = 300
 
+# ---- desk modes (normal / aggressive / night) ----
+# Practical defaults: Normal is the working mode. Night is stricter (no low-cap chase).
+# All modes remain paper-only.
+MODE_PRESETS = {
+    "normal": {
+        "pipeline_sec": 120, "analyst_min": 0.60, "skeptic_veto": 3,
+        "cooldown_sec": 1800, "alt_count": 12, "min_alt_vol": 2_000_000,
+        "desk_repeat_sec": 900, "max_positions": 5, "label": "Normal",
+    },
+    "aggressive": {
+        "pipeline_sec": 60, "analyst_min": 0.52, "skeptic_veto": 4,
+        "cooldown_sec": 900, "alt_count": 14, "min_alt_vol": 1_500_000,
+        "desk_repeat_sec": 480, "max_positions": 5, "label": "Aggressive",
+    },
+    "night": {
+        # Higher volume floor — not for meme / thin tokens
+        "pipeline_sec": 60, "analyst_min": 0.55, "skeptic_veto": 3,
+        "cooldown_sec": 900, "alt_count": 12, "min_alt_vol": 3_000_000,
+        "desk_repeat_sec": 480, "max_positions": 5, "label": "Night",
+    },
+}
+DEFAULT_MODE = "normal"
+
 CACHE = {}        # symbol -> {price, source, bar_ts}
 CACHE2 = {}       # generic TTL cache
 BOOK = {}         # binance pair -> (bid, ask)
@@ -107,10 +130,37 @@ STOP = threading.Event()
 
 # ---- Trading Floor: six bots talking in one group chat (all paper trading) ----
 BOTS = ["Chief", "Scout", "News", "Sentiment", "Charts", "Skeptic"]
-DESK = {"started": time.time(), "seq": 0, "msgs": deque(maxlen=150), "last": {}, "sum": None}
+DESK = {"started": time.time(), "seq": 0, "msgs": deque(maxlen=150), "last": {}, "sum": None, "mode": "normal"}
 DESK_LOCK = threading.Lock()
 DESK_REPEAT_SEC = 900       # same symbol is discussed again after 15 min (or when the verdict flips)
 SKEPTIC_VETO_AT = 3         # Skeptic blocks an entry when it finds this many objections
+LAST_IDLE_SAY = 0.0
+
+
+def current_mode():
+    """Active desk mode + live thresholds (from settings, falls back to Normal)."""
+    name = (get_setting("desk_mode", DEFAULT_MODE) or DEFAULT_MODE).lower().strip()
+    if name not in MODE_PRESETS:
+        name = DEFAULT_MODE
+    p = MODE_PRESETS[name]
+    return name, p
+
+
+def live_params():
+    """Resolved thresholds used by the pipeline this cycle."""
+    name, p = current_mode()
+    return {
+        "mode": name,
+        "pipeline_sec": int(p["pipeline_sec"]),
+        "analyst_min": float(p["analyst_min"]),
+        "skeptic_veto": int(p["skeptic_veto"]),
+        "cooldown_sec": int(p["cooldown_sec"]),
+        "alt_count": int(p["alt_count"]),
+        "min_alt_vol": float(p["min_alt_vol"]),
+        "desk_repeat_sec": int(p["desk_repeat_sec"]),
+        "max_positions": int(p["max_positions"]),
+        "label": p["label"],
+    }
 
 
 def say(bot, text, symbol="", tone=""):
@@ -150,6 +200,10 @@ def init():
                                 ("positions", "trail", "INTEGER DEFAULT 0"), ("bot_log", "agent", "TEXT")]:
             if col not in [r["name"] for r in c.execute(f"PRAGMA table_info({table})")]:
                 c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+        # Practical default: Normal mode unless user already chose another
+        row = c.execute("SELECT v FROM settings WHERE k=?", ("desk_mode",)).fetchone()
+        if not row:
+            c.execute("INSERT OR REPLACE INTO settings VALUES(?,?)", ("desk_mode", DEFAULT_MODE))
 
 
 init()
@@ -428,7 +482,12 @@ def rule_signal(ind):
 
 # ---------------------------------------------------------------------- agents
 def scout():
-    """Agent 1 - Scout: crypto (core + top alts by 24h volume) and US stocks; held positions always included."""
+    """Agent 1 - Scout: crypto (core + top alts by 24h volume) and US stocks; held positions always included.
+    Night / Aggressive modes expand the alt universe and prefer high-momentum names."""
+    lp = live_params()
+    alt_count = lp["alt_count"]
+    min_vol = lp["min_alt_vol"]
+    night = lp["mode"] == "night"
     stats = {}
     try:
         for t in binance_get("/api/v3/ticker/24hr", 15):
@@ -440,14 +499,24 @@ def scout():
         SCOUT_ERR.pop("crypto", None)
         alts = []
         core_pairs = {CRYPTO[s] for s in CORE}
-        for pair, t in sorted(stats.items(), key=lambda kv: -float(kv[1]["quoteVolume"])):
+        # Night: rank by |% change| * log(volume) so hot movers surface; else pure volume.
+        def rank_key(kv):
+            t = kv[1]
+            vol = float(t["quoteVolume"])
+            chg = abs(float(t["priceChangePercent"]))
+            if night:
+                return -(chg * (1 + math.log10(max(vol, 1))))
+            return -vol
+        for pair, t in sorted(stats.items(), key=rank_key):
             base = pair[:-4]
             if base in STABLES or base.endswith(("UP", "DOWN")) or pair in core_pairs:
                 continue
-            if float(t["quoteVolume"]) < MIN_ALT_VOL_USD:
-                break
+            if float(t["quoteVolume"]) < min_vol:
+                if not night:
+                    break
+                continue
             alts.append(base)
-            if len(alts) >= ALT_COUNT:
+            if len(alts) >= alt_count:
                 break
         ALTS[:] = [f"{b}-USD" for b in alts]
         for b in alts:
@@ -466,9 +535,16 @@ def scout():
         else:
             q = quote(s)
             cands.append({"symbol": s, "kind": "crypto", "price": q["price"] if q else None, "chg24": None, "vol24": None})
-    for s in STOCKS:
-        q = quote(s)
-        cands.append({"symbol": s, "kind": "stock", "price": q["price"] if q else None, "chg24": None, "vol24": None})
+    # Stocks always tracked in normal/aggressive; night focuses more on crypto movers.
+    if not night:
+        for s in STOCKS:
+            q = quote(s)
+            cands.append({"symbol": s, "kind": "stock", "price": q["price"] if q else None, "chg24": None, "vol24": None})
+    else:
+        # still keep a few large-cap names so the desk is not crypto-only
+        for s in ["SPY", "QQQ", "NVDA", "TSLA", "AAPL"]:
+            q = quote(s)
+            cands.append({"symbol": s, "kind": "stock", "price": q["price"] if q else None, "chg24": None, "vol24": None})
     have = {c["symbol"] for c in cands}
     for s in held_symbols():
         if s not in have:
@@ -823,8 +899,10 @@ def risk_plan(pf, symbol, px):
 
 def skeptic_review(cand, d, ind, score, rules):
     """Skeptic bot: argues against every trade. Returns (objections, veto)."""
+    lp = live_params()
+    veto_at = lp["skeptic_veto"]
     obj = []
-    if ind["rsi"] > 65:
+    if ind and ind.get("rsi", 50) > 65:
         obj.append(f"RSI {ind['rsi']:.0f} เริ่มร้อนแรง")
     vr = d.get("vol_ratio")
     if vr is not None and vr < 1.3:
@@ -847,18 +925,21 @@ def skeptic_review(cand, d, ind, score, rules):
     chg = cand.get("chg24")
     if chg is not None and chg > 8:
         obj.append(f"ขึ้นมาแล้ว {chg:+.1f}% ใน 24 ชม. เสี่ยงไล่ราคา")
-    return obj, bool(severe) or len(obj) >= SKEPTIC_VETO_AT
+    # Night mode: still block severe 8-K, but allow a bit more momentum noise
+    return obj, bool(severe) or len(obj) >= veto_at
 
 
 def desk_talk(cand, d, ind, score, obj, veto, auto, px, talk):
     """The six bots discuss one candidate in the group chat (rate-limited per symbol)."""
+    lp = live_params()
     sym = cand["symbol"]
     prev = DESK["last"].get(sym)
-    if not talk or (prev and time.time() - prev[0] < DESK_REPEAT_SEC and prev[1] == veto):
+    if not talk or (prev and time.time() - prev[0] < lp["desk_repeat_sec"] and prev[1] == veto):
         return
     DESK["last"][sym] = (time.time(), veto)
     chg, vol, vr = cand.get("chg24"), cand.get("vol24"), d.get("vol_ratio")
-    say("Scout", f"เจอ {sym} @ {px:.6g}" + (f" · 24 ชม. {chg:+.1f}%" if chg is not None else "") +
+    night_tag = " 🌙" if lp["mode"] == "night" else ""
+    say("Scout", f"เจอ {sym}{night_tag} @ {px:.6g}" + (f" · 24 ชม. {chg:+.1f}%" if chg is not None else "") +
         (f" · วอลุ่ม ${vol / 1e6:.1f}M" if vol else ""), sym)
     nr = d.get("news_read")
     if nr is None:
@@ -885,10 +966,14 @@ def desk_talk(cand, d, ind, score, obj, veto, auto, px, talk):
         mood, tone = f"ความสนใจปกติถึงเพิ่มขึ้น (วอลุ่ม {vr:.1f}×)", "ok"
     else:
         mood, tone = "ฝูงชนยังเงียบ ไม่มีข้อมูลวอลุ่มเทียบ", "warn"
+    if lp["mode"] == "night" and chg is not None and abs(chg) >= 8:
+        mood = f"Night scan · ตัวนี้เคลื่อนแรง {chg:+.1f}% · " + mood
+        tone = "warn"
     say("Sentiment", mood + " · ประเมินจากวอลุ่ม/ราคา ไม่ได้อ่านโซเชียล", sym, tone)
-    gap = (ind["ema9"] - ind["ema21"]) / ind["ema21"] if ind["ema21"] else 0.0
+    gap = (ind["ema9"] - ind["ema21"]) / ind["ema21"] if ind and ind.get("ema21") else 0.0
+    rsi = ind["rsi"] if ind else 50
     say("Charts", f"เข้า {px:.6g} · stop {px * (1 - STOP_LOSS_PCT):.6g} (-{STOP_LOSS_PCT:.0%}) · "
-        f"เป้า {px * (1 + TARGET_PCT):.6g} (+{TARGET_PCT:.0%}) · EMA gap {gap * 100:+.2f}% · RSI {ind['rsi']:.0f}", sym)
+        f"เป้า {px * (1 + TARGET_PCT):.6g} (+{TARGET_PCT:.0%}) · EMA gap {gap * 100:+.2f}% · RSI {rsi:.0f}", sym)
     if obj:
         say("Skeptic", "ค้านนะ: " + "; ".join(obj) + (" → VETO" if veto else " → ยังพอรับได้"), sym, "bad" if veto else "warn")
     else:
@@ -896,7 +981,7 @@ def desk_talk(cand, d, ind, score, obj, veto, auto, px, talk):
     if veto:
         say("Chief", f"ตัดสิน: ข้าม {sym} ตาม Skeptic (ค้าน {len(obj)} ข้อ)", sym, "bad")
     elif auto:
-        say("Chief", f"ตัดสิน: เข้า {sym} คะแนน {score:.2f} → ส่งให้ Risk/Executor", sym, "ok")
+        say("Chief", f"ตัดสิน: เข้า {sym} คะแนน {score:.2f} → ส่งให้ Risk/Executor [{lp['label']}]", sym, "ok")
     else:
         say("Chief", f"ตัดสิน: {sym} ผ่านทีม (คะแนน {score:.2f}) แต่ Auto ปิดอยู่ จึงยังไม่ส่งคำสั่ง", sym)
 
@@ -912,10 +997,14 @@ def _kill(row, agent, reason, log_it=True):
 
 def run_cycle(cands=None, gather=None, ind_fn=None):
     """One pass of the pipeline: Scout -> Filter -> Analyst -> Risk -> Executor (Logger records everything)."""
+    lp = live_params()
     cands = scout() if cands is None else cands
     gather = gather or gather_data
     ind_fn = ind_fn or get_ind
     auto = get_setting("auto_enabled", "0") == "1"
+    analyst_min = lp["analyst_min"]
+    max_pos = lp["max_positions"]
+    cooldown = lp["cooldown_sec"]
     with db() as c:
         pf = portfolio(c)
         last = {r["symbol"]: r["ts"] for r in c.execute("SELECT symbol, MAX(ts) ts FROM trades GROUP BY symbol")}
@@ -977,8 +1066,8 @@ def run_cycle(cands=None, gather=None, ind_fn=None):
             _kill(row, "Analyst", why)
             continue
         row["score"] = score
-        if score < ANALYST_MIN:
-            _kill(row, "Analyst", f"คะแนน {score:.2f} < {ANALYST_MIN} · {why}")
+        if score < analyst_min:
+            _kill(row, "Analyst", f"คะแนน {score:.2f} < {analyst_min} · {why}")
             continue
         row["note"] = why
         n_analyst += 1
@@ -992,7 +1081,7 @@ def run_cycle(cands=None, gather=None, ind_fn=None):
         d["news_read"] = news_read(sym)
         d["sec"] = sec_8k(sym) if cand["kind"] == "stock" else None
         objections, veto = skeptic_review(cand, d, ind, score, row["rules"])
-        desk_talk(cand, d, ind, score, objections, veto, auto, q["price"], n_rank < 4)
+        desk_talk(cand, d, ind, score, objections, veto, auto, q["price"], n_rank < 5)
         if veto:
             row["stage"] = "skeptic"
             _kill(row, "Skeptic", "ค้าน: " + "; ".join(objections))
@@ -1001,11 +1090,11 @@ def run_cycle(cands=None, gather=None, ind_fn=None):
         if not auto:
             row["note"] += " · Auto ปิดอยู่ จึงไม่ส่งคำสั่ง"
             continue
-        if len(held) >= AUTO_MAX_POSITIONS:
-            row["note"] += f" · ถือครบ {AUTO_MAX_POSITIONS} สถานะแล้ว"
+        if len(held) >= max_pos:
+            row["note"] += f" · ถือครบ {max_pos} สถานะแล้ว"
             continue
         lt = last.get(sym)
-        if lt and time.time() - datetime.fromisoformat(lt).timestamp() < AUTO_COOLDOWN_SEC:
+        if lt and time.time() - datetime.fromisoformat(lt).timestamp() < cooldown:
             row["note"] += " · พักหลังเทรดล่าสุด"
             continue
         plan, why = risk_plan(pf, sym, q["price"])
@@ -1018,7 +1107,7 @@ def run_cycle(cands=None, gather=None, ind_fn=None):
             continue
         qty = spend / q["price"]
         try:
-            execute_trade(sym, "BUY", qty, f"auto:analyst {score:.2f}", q["price"], stop=plan["stop"])
+            execute_trade(sym, "BUY", qty, f"auto:{lp['mode']} {score:.2f}", q["price"], stop=plan["stop"])
         except HTTPException as e:
             _kill(row, "Risk", str(e.detail))
             continue
@@ -1026,19 +1115,41 @@ def run_cycle(cands=None, gather=None, ind_fn=None):
         held[sym] = {"qty": qty}
         n_exec += 1
         row.update(verdict="bought", note=f"ซื้อ {qty:.6g} @ {q['price']:.6g} · stop {plan['stop']:.6g} (-{STOP_LOSS_PCT:.0%})")
-        bot_log("Executor", sym, "BUY", f"คะแนน {score:.2f} · ซื้อ {qty:.6g} @ {q['price']:.6g} · Risk ตั้ง stop {plan['stop']:.6g}")
-        say("Chief", f"ซื้อ {sym} {qty:.6g} @ {q['price']:.6g} · stop {plan['stop']:.6g}", sym, "ok")
+        bot_log("Executor", sym, "BUY", f"[{lp['label']}] คะแนน {score:.2f} · ซื้อ {qty:.6g} @ {q['price']:.6g} · Risk ตั้ง stop {plan['stop']:.6g}")
+        say("Chief", f"ซื้อ {sym} {qty:.6g} @ {q['price']:.6g} · stop {plan['stop']:.6g} [{lp['label']}]", sym, "ok")
 
     order = {"bought": 0, "exit": 1, "held": 2, "passed": 3, "killed": 4}
     rows.sort(key=lambda r: (order.get(r["verdict"], 5), -(r["score"] or 0)))
     PIPE.update(ts=time.time(), cycle=PIPE["cycle"] + 1, auto=auto, rows=rows,
-                counts={"scout": len(cands), "filter": n_filter, "analyst": n_analyst, "executor": n_exec})
-    sig = (len(cands), n_filter, n_analyst, n_exec)
-    if DESK["sum"] != sig or PIPE["cycle"] % 10 == 1:
-        say("Chief", f"รอบ #{PIPE['cycle']}: สแกน {sig[0]} → ผ่าน Filter {sig[1]} → ผ่าน Analyst {sig[2]} → ส่งคำสั่ง {sig[3]}" +
+                counts={"scout": len(cands), "filter": n_filter, "analyst": n_analyst, "executor": n_exec},
+                mode=lp["mode"], analyst_min=analyst_min)
+    sig = (len(cands), n_filter, n_analyst, n_exec, lp["mode"])
+    if DESK["sum"] != sig or PIPE["cycle"] % 8 == 1:
+        mode_txt = f" · โหมด {lp['label']}"
+        say("Chief", f"รอบ #{PIPE['cycle']}: สแกน {sig[0]} → ผ่าน Filter {sig[1]} → ผ่าน Analyst {sig[2]} → ส่งคำสั่ง {sig[3]}{mode_txt}" +
             ("" if auto else " · Auto ปิดอยู่"))
         DESK["sum"] = sig
+    # occasional idle chatter so the floor feels alive
+    maybe_idle_chatter(auto, lp)
     return PIPE
+
+
+def maybe_idle_chatter(auto, lp):
+    """Light heartbeat messages when the desk is quiet (keeps the chat feeling alive)."""
+    global LAST_IDLE_SAY
+    now = time.time()
+    if now - LAST_IDLE_SAY < 420:
+        return
+    if DESK["msgs"] and now - datetime.fromisoformat(DESK["msgs"][-1]["ts"]).timestamp() < 180:
+        return
+    LAST_IDLE_SAY = now
+    if lp["mode"] == "night":
+        say("Scout", "Night mode · กำลังสแกนเหรียญที่วอลุ่ม/โมเมนตัมสูง รอตัวที่ผ่านทีม", tone="ok")
+        say("Chief", "ทีมยัง online · รอรอบถัดไป (Night เร็วกว่าปกติ)", tone="")
+    elif auto:
+        say("Chief", f"ทีมทำงานต่อเนื่อง · โหมด {lp['label']} · รอบถัดไปใน ~{lp['pipeline_sec']} วิ", tone="")
+    else:
+        say("Chief", "Auto ยังปิดอยู่ · เปิดได้ที่สวิตช์ Auto Trading ถ้าอยากให้ทีมส่งคำสั่งเอง", tone="warn")
 
 
 # -------------------------------------------------------------------- portfolio
@@ -1155,9 +1266,14 @@ def price_loop():
 
 def pipeline_loop():
     STOP.wait(4)  # let the first prices arrive
+    # One-time desk intro for practical defaults
+    lp0 = live_params()
+    say("Chief", f"ทีมพร้อม · โหมดเริ่มต้น {lp0['label']} · Auto ยังปิดอยู่จนกว่าจะเปิดเอง · "
+        f"Scout/News/Sentiment/Charts/Skeptic ทำงานตามหน้าที่ · Risk ตั้ง stop ก่อนเข้าทุกครั้ง", tone="ok")
     while not STOP.is_set():
         _safe(run_cycle)
-        STOP.wait(PIPELINE_SEC)
+        lp = live_params()
+        STOP.wait(max(30, lp["pipeline_sec"]))
 
 
 def worker():
@@ -1241,25 +1357,28 @@ def market():
 
 @api.get("/pipeline")
 def pipeline():
+    lp = live_params()
     return {"cycle": PIPE["cycle"], "age": int(time.time() - PIPE["ts"]) if PIPE["ts"] else None, "auto": PIPE["auto"],
             "counts": PIPE["counts"], "rows": PIPE["rows"], "scout_error": SCOUT_ERR.get("crypto"),
-            "analyst_min": ANALYST_MIN}
+            "analyst_min": PIPE.get("analyst_min", lp["analyst_min"]), "mode": lp["mode"]}
 
 
 @api.get("/desk")
 def desk():
     now = time.time()
+    lp = live_params()
     with db() as c:
         pf = portfolio(c)
         sells = [r["pnl"] for r in c.execute("SELECT pnl FROM trades WHERE side='SELL'")]
     spoke = {}
     for m in list(DESK["msgs"]):
         spoke[m["bot"]] = datetime.fromisoformat(m["ts"]).timestamp()
-    alive = bool(PIPE["ts"]) and now - PIPE["ts"] < PIPELINE_SEC * 3
+    alive = bool(PIPE["ts"]) and now - PIPE["ts"] < lp["pipeline_sec"] * 3
     bots = [{"bot": b, "state": "online" if (b == "Chief" and alive) or now - spoke.get(b, 0) < 120 else "idle"} for b in BOTS]
     return {"bots": bots, "messages": list(DESK["msgs"])[-60:], "uptime": int(now - DESK["started"]),
             "cycle": PIPE["cycle"], "equity": pf["equity"], "pnl": pf["equity"] - pf["initial"],
-            "closed": len(sells), "win_rate": (sum(1 for x in sells if x > 0) / len(sells)) if sells else None}
+            "closed": len(sells), "win_rate": (sum(1 for x in sells if x > 0) / len(sells)) if sells else None,
+            "mode": lp["mode"], "mode_label": lp["label"]}
 
 
 @api.get("/newstone")
@@ -1302,14 +1421,48 @@ def equity_curve():
 
 @api.get("/bot")
 def bot_status():
+    lp = live_params()
     with db() as c:
         rows = c.execute("SELECT ts,agent,symbol,action,msg FROM bot_log ORDER BY id DESC LIMIT 40").fetchall()
     return {"enabled": get_setting("auto_enabled", "0") == "1",
             "analysis_age": int(time.time() - PIPE["ts"]) if PIPE["ts"] else None,
-            "params": {"trade_pct": MAX_TRADE_PCT, "max_positions": AUTO_MAX_POSITIONS,
-                       "cooldown_min": AUTO_COOLDOWN_SEC // 60, "interval_sec": PIPELINE_SEC,
-                       "analyst_min": ANALYST_MIN},
+            "mode": lp["mode"], "mode_label": lp["label"],
+            "params": {"trade_pct": MAX_TRADE_PCT, "max_positions": lp["max_positions"],
+                       "cooldown_min": lp["cooldown_sec"] // 60, "interval_sec": lp["pipeline_sec"],
+                       "analyst_min": lp["analyst_min"], "skeptic_veto": lp["skeptic_veto"]},
             "log": [dict(r) for r in rows]}
+
+
+class ModeSwitch(BaseModel):
+    mode: str  # normal | aggressive | night
+
+
+@api.get("/mode")
+def get_mode():
+    lp = live_params()
+    return {"mode": lp["mode"], "label": lp["label"], "presets": {
+        k: {"label": v["label"], "pipeline_sec": v["pipeline_sec"], "analyst_min": v["analyst_min"],
+            "skeptic_veto": v["skeptic_veto"], "cooldown_min": v["cooldown_sec"] // 60,
+            "max_positions": v["max_positions"], "alt_count": v["alt_count"]}
+        for k, v in MODE_PRESETS.items()
+    }}
+
+
+@api.post("/mode")
+def set_mode(m: ModeSwitch):
+    name = (m.mode or "").lower().strip()
+    if name not in MODE_PRESETS:
+        raise HTTPException(400, "mode ต้องเป็น normal, aggressive หรือ night")
+    old = get_setting("desk_mode", DEFAULT_MODE)
+    set_setting("desk_mode", name)
+    lp = live_params()
+    if old != name:
+        say("Chief", f"เปลี่ยนโหมดเป็น {lp['label']} · รอบ ~{lp['pipeline_sec']} วิ · Analyst ≥ {lp['analyst_min']} · "
+            f"Skeptic veto ที่ {lp['skeptic_veto']} ข้อ · พัก {lp['cooldown_sec'] // 60} นาที/ตัว", tone="ok")
+        if name == "night":
+            say("Scout", "Night mode เปิด · จะโฟกัสเหรียญที่มีโมเมนตัม/วอลุ่มสูง และสแกนบ่อยขึ้น", tone="ok")
+            say("Skeptic", "Night ผ่อนเกณฑ์ลงเล็กน้อย แต่ยังบล็อก 8-K ร้ายแรงและจุดค้านหนัก", tone="warn")
+    return {"ok": True, "mode": name, "label": lp["label"]}
 
 
 @api.post("/bot")

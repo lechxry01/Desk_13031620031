@@ -39,3 +39,8 @@ button:disabled{opacity:.5;cursor:wait}
 @media(max-width:560px){.tonerow{grid-template-columns:62px 1fr 70px 42px}.tonerow svg{width:70px}}
 
 #filings a{color:#58d6b0}
+
+.modes{display:flex;gap:6px;margin:8px 0 6px;flex-wrap:wrap}
+.modes button{flex:1;min-width:90px;background:#18283f;border:1px solid #28405f;color:#9fb2cc;border-radius:10px;padding:8px 6px;font-size:12px;cursor:pointer}
+.modes button.active{background:#1f3d4f;border-color:#2bb89a;color:#5be0b4;font-weight:600}
+.modes button[data-mode="night"].active{border-color:#7c6bcf;color:#c4b5fd;background:#2a2440}

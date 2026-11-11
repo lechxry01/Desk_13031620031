@@ -81,7 +81,8 @@ function renderDesk(d) {
     if (near) box.scrollTop = box.scrollHeight;
     CHATLAST = last;
   }
-  $("floorage").textContent = d.bots.filter(x => x.state === "online").length + " online · รอบ " + d.cycle;
+  const modeTxt = d.mode_label ? " · " + d.mode_label : "";
+  $("floorage").textContent = d.bots.filter(x => x.state === "online").length + " online · รอบ " + d.cycle + modeTxt;
 }
 
 function renderFilings(d) {
@@ -148,8 +149,12 @@ const ACT = {BUY: "🟢 ซื้อ", SELL: "🔴 ขาย", kill: "☠️ ต
 function renderBot(b) {
   $("autoSwitch").checked = b.enabled;
   const p = b.params;
+  const mode = b.mode || "normal";
+  document.querySelectorAll("#modes button").forEach(btn => {
+    btn.classList.toggle("active", btn.dataset.mode === mode);
+  });
   $("botstatus").textContent = (b.enabled ? "● ทำงานอยู่ (บัญชีจำลอง)" : "○ ปิดอยู่") +
-    ` · ไม้ละไม่เกิน ${p.trade_pct * 100}% ของพอร์ต · สูงสุด ${p.max_positions} สถานะ · Analyst ≥ ${p.analyst_min} · พักต่อสัญลักษณ์ ${p.cooldown_min} นาที` +
+    ` · โหมด ${b.mode_label || mode} · ไม้ละ ≤ ${p.trade_pct * 100}% · สูงสุด ${p.max_positions} สถานะ · Analyst ≥ ${p.analyst_min} · Skeptic veto ${p.skeptic_veto || 3} · พัก ${p.cooldown_min} นาที` +
     (b.analysis_age != null ? ` · รอบล่าสุด ${b.analysis_age} วิที่แล้ว (ทุก ${p.interval_sec} วิ)` : " · กำลังเริ่มรอบแรก…");
   $("botlog").innerHTML = b.log.length ? b.log.map(l => `
     <div class="traderow"><b>${ACT[l.action] || esc(l.action)} ${l.symbol === "-" ? "" : esc(l.symbol)}</b><span>${esc(l.msg)}</span><span>${esc(l.agent || "")} · ${ago(l.ts)}ที่แล้ว</span></div>`).join("")
@@ -161,6 +166,14 @@ async function toggleAuto(el) {
   if (want && !confirm("เปิด Auto Trading?\nทีม Agent จะซื้อ/ขายในบัญชีจำลองให้เอง (ไม่ใช่เงินจริง และไม่เชื่อมกับ MT5/XM)")) { el.checked = false; return; }
   try { await api("/api/bot", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({enabled: want})}); toast(want ? "เปิด Auto Trading แล้ว" : "ปิด Auto Trading แล้ว", "ok"); refresh(true); }
   catch (err) { el.checked = !want; toast(err.message, "err"); }
+}
+
+async function setMode(mode) {
+  try {
+    const d = await api("/api/mode", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({mode})});
+    toast("เปลี่ยนเป็นโหมด " + (d.label || mode) + " แล้ว", "ok");
+    refresh(true);
+  } catch (err) { toast(err.message, "err"); }
 }
 
 function spark(pts) {

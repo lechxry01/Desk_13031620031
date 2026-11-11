@@ -38,6 +38,11 @@
 <section class="panel">
   <div class="heading"><h2>🤖 Auto Trading</h2>
     <label class="switch"><input type="checkbox" id="autoSwitch" onchange="toggleAuto(this)"><span></span></label></div>
+  <div class="modes" id="modes">
+    <button type="button" data-mode="normal" onclick="setMode('normal')">Normal</button>
+    <button type="button" data-mode="aggressive" onclick="setMode('aggressive')">Aggressive</button>
+    <button type="button" data-mode="night" onclick="setMode('night')">Night 🌙</button>
+  </div>
   <div id="botstatus" class="muted">กำลังโหลด…</div>
   <div id="botlog" class="table"></div>
 </section>

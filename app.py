@@ -1040,10 +1040,12 @@ def run_cycle(cands=None, gather=None, ind_fn=None):
                        note=f"ถืออยู่ · stop {p['stop']:.6g}" + (" · trailing" if p["trail"] else ""))
             if ind and auto and rule_signal(ind)[0] == "SELL":
                 try:
-                    execute_trade(sym, "SELL", p["qty"], "auto:trend-exit", q["price"], enforce_risk=False)
-                    bot_log("Executor", sym, "SELL", f"ปิดสถานะ @ {q['price']:.6g} · {rule_signal(ind)[2]}")
-                    say("Chief", f"ปิด {sym} @ {q['price']:.6g} · {rule_signal(ind)[2]}", sym, "warn")
-                    row.update(verdict="exit", note="ปิดสถานะตามสัญญาณ")
+                    res = execute_trade(sym, "SELL", p["qty"], "auto:trend-exit", q["price"], enforce_risk=False)
+                    pl = pnl_text(res["pnl"], res.get("avg"), q["price"])
+                    tone = "ok" if res["pnl"] >= 0 else "bad"
+                    bot_log("Executor", sym, "SELL", f"ปิด @ {q['price']:.6g} · {pl} · {rule_signal(ind)[2]}")
+                    say("Chief", f"ปิด {sym} @ {q['price']:.6g} · {pl} · {rule_signal(ind)[2]}", sym, tone)
+                    row.update(verdict="exit", note=f"ปิดตามสัญญาณ · {pl}")
                     n_exec += 1
                     held.pop(sym)
                 except HTTPException as e:
@@ -1184,12 +1186,27 @@ def risk_check_buy(c, symbol, qty, px):
         raise HTTPException(400, f"Risk: เกินกรอบ {MAX_POSITION_PCT:.0%} ของพอร์ตต่อสัญลักษณ์ (ซื้อเพิ่มได้สูงสุด ≈ {room:.6g})")
 
 
+def pnl_text(pnl, avg=None, px=None):
+    """Thai label for realized P/L (used in chat + logs)."""
+    if pnl > 0:
+        tag = f"กำไร +${pnl:.2f}"
+    elif pnl < 0:
+        tag = f"ขาดทุน −${abs(pnl):.2f}"
+    else:
+        tag = "คุ้มทุน $0.00"
+    if avg and px and avg > 0:
+        pct = (px / avg - 1) * 100
+        tag += f" ({pct:+.2f}%)"
+    return tag
+
+
 def execute_trade(symbol, side, qty, strategy, px, enforce_risk=True, stop=None):
     fee = px * qty * FEE_RATE
     with TRADE_LOCK, db() as c:
         a = c.execute("SELECT * FROM account WHERE id=1").fetchone()
         p = c.execute("SELECT * FROM positions WHERE symbol=?", (symbol,)).fetchone()
         pnl = 0.0
+        avg_cost = float(p["avg"]) if p and p["avg"] else None
         if side == "BUY":
             cost = px * qty + fee
             if cost > a["cash"]:
@@ -1218,7 +1235,7 @@ def execute_trade(symbol, side, qty, strategy, px, enforce_risk=True, stop=None)
                 c.execute("UPDATE positions SET qty=? WHERE symbol=?", (left, symbol))
         c.execute("INSERT INTO trades(ts,symbol,side,qty,price,fee,pnl,strategy) VALUES(?,?,?,?,?,?,?,?)",
                   (datetime.now(timezone.utc).isoformat(), symbol, side, qty, px, fee, pnl, strategy))
-    return {"ok": True, "price": px, "fee": fee, "pnl": pnl}
+    return {"ok": True, "price": px, "fee": fee, "pnl": pnl, "avg": avg_cost}
 
 
 def check_exits():
@@ -1243,10 +1260,13 @@ def check_exits():
                 c.execute("UPDATE positions SET peak=?, trail=?, stop=? WHERE symbol=?", (peak, trail, stop, p["symbol"]))
         if px <= stop:
             try:
-                execute_trade(p["symbol"], "SELL", p["qty"], "trailing-stop" if trail else "stop-loss", px, enforce_risk=False)
+                res = execute_trade(p["symbol"], "SELL", p["qty"], "trailing-stop" if trail else "stop-loss", px, enforce_risk=False)
+                reason = "Trailing stop" if trail else "Stop-loss"
+                pl = pnl_text(res["pnl"], res.get("avg"), px)
+                tone = "ok" if res["pnl"] >= 0 else "bad"
                 bot_log("Risk", p["symbol"], "trailing-stop" if trail else "stop-loss",
-                        f"ปิดสถานะ {p['symbol']} @ {px:.6g} (stop {stop:.6g})")
-                say("Chief", f"{'Trailing stop' if trail else 'Stop-loss'} ทำงาน ปิด {p['symbol']} @ {px:.6g}", p["symbol"], "bad")
+                        f"ปิด {p['symbol']} @ {px:.6g} · {pl} (stop {stop:.6g})")
+                say("Chief", f"{reason} ปิด {p['symbol']} @ {px:.6g} · {pl}", p["symbol"], tone)
             except HTTPException as e:
                 log.warning("exit failed %s: %s", p["symbol"], e.detail)
 

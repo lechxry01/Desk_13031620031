@@ -108,8 +108,9 @@ function renderTone(d) {
 
 function fillCard(t) {
   const el = $("fill"), sell = t.side === "SELL";
+  const plLabel = t.pnl > 0 ? "กำไร +" + money(t.pnl) : t.pnl < 0 ? "ขาดทุน −" + money(Math.abs(t.pnl)) : "คุ้มทุน";
   el.innerHTML = `<small>${sell ? "POSITION CLOSED" : "BIG FILL"} · ${esc(t.side)}</small><strong>${esc(t.symbol)}</strong>` +
-    (sell ? `<span class="${t.pnl >= 0 ? "pos" : "neg"}">${t.pnl >= 0 ? "+" : ""}${money(t.pnl)}</span>` : `<span>${t.qty} @ ${money(t.price)}</span>`);
+    (sell ? `<span class="${t.pnl >= 0 ? "pos" : "neg"}">${plLabel}</span>` : `<span>${t.qty} @ ${money(t.price)}</span>`);
   el.className = "show";
   clearTimeout(fillCard.t);
   fillCard.t = setTimeout(() => (el.className = ""), 3500);
@@ -196,13 +197,22 @@ function renderAccount(a) {
   else if (top > SEEN) { fillCard(a.trades.find(t => t.id > SEEN)); SEEN = top; }
   const L = a.limits;
   $("limits").textContent = `ค่าธรรมเนียมจำลอง ${(L.fee_rate * 100).toFixed(1)}% · ไม้ละ ≤ ${L.max_trade_pct * 100}% · รวมต่อตัว ≤ ${L.max_position_pct * 100}% · Stop -${L.stop_loss_pct * 100}% ตั้งก่อนเข้า · Trailing ${L.trail_pct * 100}% เมื่อกำไร +${L.trail_activate_pct * 100}% · ไม่มีคำสั่งเงินจริง`;
-  $("positions").innerHTML = a.positions.length ? a.positions.map(p => `
-    <div class="posrow"><b>${esc(p.symbol)}</b><span>${p.qty.toFixed(6)} @ ${money(p.avg)}${p.stop ? ` · stop ${money(p.stop)}${p.trail ? " (trailing)" : ""}` : ""}</span>
-    <strong class="${p.unrealized >= 0 ? "buy" : "sell"}">${money(p.unrealized)} (${pct(p.pct)})</strong></div>`).join("")
+  $("positions").innerHTML = a.positions.length ? a.positions.map(p => {
+    const u = p.unrealized >= 0 ? `กำไร +${money(p.unrealized)}` : `ขาดทุน −${money(Math.abs(p.unrealized))}`;
+    return `<div class="posrow"><b>${esc(p.symbol)}</b><span>${p.qty.toFixed(6)} @ ${money(p.avg)}${p.stop ? ` · stop ${money(p.stop)}${p.trail ? " (trailing)" : ""}` : ""}</span>
+    <strong class="${p.unrealized >= 0 ? "buy" : "sell"}">${u} (${pct(p.pct)})</strong></div>`;
+  }).join("")
     : '<div class="empty">ยังไม่มีสถานะ</div>';
-  $("trades").innerHTML = a.trades.length ? a.trades.map(t => `
-    <div class="traderow"><b>${t.side} ${t.symbol}</b><span>${t.qty} @ ${money(t.price)}${t.side === "SELL" ? ` · P/L ${money(t.pnl)}` : ""}</span>
-    <span>${new Date(t.ts).toLocaleString()} · ${t.strategy || ""}</span></div>`).join("")
+  $("trades").innerHTML = a.trades.length ? a.trades.map(t => {
+    let pl = "";
+    if (t.side === "SELL") {
+      const cls = t.pnl > 0 ? "buy" : t.pnl < 0 ? "sell" : "";
+      const label = t.pnl > 0 ? `กำไร +${money(t.pnl)}` : t.pnl < 0 ? `ขาดทุน −${money(Math.abs(t.pnl))}` : "คุ้มทุน";
+      pl = ` · <strong class="${cls}">${label}</strong>`;
+    }
+    return `<div class="traderow"><b>${t.side} ${t.symbol}</b><span>${t.qty} @ ${money(t.price)}${pl}</span>
+    <span>${new Date(t.ts).toLocaleString()} · ${t.strategy || ""}</span></div>`;
+  }).join("")
     : '<div class="empty">ยังไม่มีรายการ</div>';
 }
 

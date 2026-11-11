@@ -2,7 +2,7 @@ const $ = id => document.getElementById(id);
 const money = n => "$" + Number(n || 0).toLocaleString("en-US", {minimumFractionDigits: 2, maximumFractionDigits: 2});
 const pct = n => (n >= 0 ? "+" : "") + (n * 100).toFixed(2) + "%";
 let KEY = localStorage.getItem("appkey") || "";
-let ACCOUNT = null, PRICES = {}, PICK = null, busy = false, asking = null;
+let ACCOUNT = null, PRICES = {}, PICK = null, busy = false, asking = null, tick = 0;
 
 function toast(msg, kind = "info") {
   const t = $("toast");
@@ -43,9 +43,11 @@ const BADGE = {
 };
 
 function renderMarket(items) {
+  const old = PRICES;
   PRICES = Object.fromEntries(items.map(x => [x.symbol, x]));
+  const dir = x => !old[x.symbol] || old[x.symbol].price == null || x.price == null ? "" : x.price > old[x.symbol].price ? "up" : x.price < old[x.symbol].price ? "down" : "";
   $("market").innerHTML = items.map(x => `
-    <div class="marketrow"><b>${x.symbol}</b><strong>${x.price == null ? "—" : money(x.price)}</strong>
+    <div class="marketrow"><b>${x.symbol}</b><strong class="${dir(x)}">${x.price == null ? "—" : money(x.price)}</strong>
     <span class="muted">${x.source}</span>
     ${BADGE[x.status] ? `<small class="badge ${x.status}">${BADGE[x.status]}</small>` : ""}</div>`).join("");
   const sel = $("symbol");
@@ -63,6 +65,32 @@ function renderSignals(list) {
       ${x.signal !== "WAIT" && x.risk_ok ? `<div><button class="mini" onclick="useSignal(${i})">ใช้สัญญาณนี้</button></div>` : ""}
     </div></div>`).join("");
   window.SIGNALS = list;
+  const ages = list.map(x => x.age).filter(a => a != null);
+  if (ages.length) $("sigage").textContent = `วิเคราะห์ล่าสุด ${Math.max(...ages)} วิที่แล้ว · รอบละ 1 นาที`;
+}
+
+function ago(iso) {
+  const s = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
+  return s < 60 ? s + " วิ" : s < 3600 ? Math.floor(s / 60) + " นาที" : Math.floor(s / 3600) + " ชม.";
+}
+const ACT = {BUY: "🟢 ซื้อ", SELL: "🔴 ขาย", "stop-loss": "🛑 Stop-loss", "take-profit": "✅ Take-profit", skip: "⚠️ ข้าม", system: "⚙️ ระบบ"};
+
+function renderBot(b) {
+  $("autoSwitch").checked = b.enabled;
+  const p = b.params;
+  $("botstatus").textContent = (b.enabled ? "● ทำงานอยู่ (บัญชีจำลอง)" : "○ ปิดอยู่") +
+    ` · ไม้ละ ${p.trade_pct * 100}% ของพอร์ต · สูงสุด ${p.max_positions} สถานะ · พักต่อสัญลักษณ์ ${p.cooldown_min} นาที` +
+    (b.analysis_age != null ? ` · วิเคราะห์ล่าสุด ${b.analysis_age} วิที่แล้ว` : " · กำลังเริ่มวิเคราะห์…");
+  $("botlog").innerHTML = b.log.length ? b.log.map(l => `
+    <div class="traderow"><b>${ACT[l.action] || l.action} ${l.symbol === "-" ? "" : l.symbol}</b><span>${l.msg}</span><span>${ago(l.ts)}ที่แล้ว</span></div>`).join("")
+    : '<div class="empty">ยังไม่มีกิจกรรมจากบอท</div>';
+}
+
+async function toggleAuto(el) {
+  const want = el.checked;
+  if (want && !confirm("เปิด Auto Trading?\nบอทจะซื้อ/ขายในบัญชีจำลองให้เองตามสัญญาณ (ไม่ใช่เงินจริง และไม่เชื่อมกับ MT5/XM)")) { el.checked = false; return; }
+  try { await api("/api/bot", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({enabled: want})}); toast(want ? "เปิด Auto Trading แล้ว" : "ปิด Auto Trading แล้ว", "ok"); refresh(true); }
+  catch (err) { el.checked = !want; toast(err.message, "err"); }
 }
 
 function useSignal(i) {
@@ -114,8 +142,11 @@ async function refresh(manual = false) {
   if (busy || (document.hidden && !manual)) return;
   busy = true;
   try {
-    const [m, s, a, e] = await Promise.all([api("/api/market"), api("/api/signals"), api("/api/account"), api("/api/equity")]);
-    renderMarket(m.items); renderSignals(s.signals); renderAccount(a); spark(e.points);
+    const calls = [api("/api/market"), api("/api/signals"), api("/api/account"), api("/api/bot")];
+    if (tick++ % 6 === 0 || manual) calls.push(api("/api/equity"));
+    const [m, s, a, b, e] = await Promise.all(calls);
+    renderMarket(m.items); renderSignals(s.signals); renderAccount(a); renderBot(b);
+    if (e) spark(e.points);
   } catch (err) { toast(err.message, "err"); }
   finally { busy = false; }
 }
@@ -143,6 +174,6 @@ async function resetAccount() {
 }
 
 refresh(true);
-setInterval(refresh, 15000);
+setInterval(refresh, 5000);  // prices come from a live cache, so 5s polling is cheap
 document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(true); });
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});

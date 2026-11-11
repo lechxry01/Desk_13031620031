@@ -1,4 +1,4 @@
-"""AI Trading Desk PRO - Phase 2.1 (paper trading only)."""
+"""AI Trading Desk PRO - Phase 3 (paper trading only)."""
 import asyncio
 import hmac
 import json
@@ -40,12 +40,20 @@ MAX_DRAWDOWN_PCT = 0.20     # no new BUY once equity is down 20%
 WS_FRESH_SEC = 45           # Binance tick considered fresh
 CRYPTO_STALE_SEC = 300      # crypto price older than this -> stale, trades blocked
 STOCK_CLOSED_SEC = 1800     # stock bar older than this -> market closed / delayed
-PRICE_LOOP_SEC = 30
-SIGNAL_LOOP_SEC = 300
+TICK_SEC = 5                # worker heartbeat: SL/TP is checked this often on live prices
+PRICE_LOOP_SEC = 30         # Yahoo refresh (stocks + crypto fallback)
+SIGNAL_LOOP_SEC = 60        # re-analysis interval
 SNAPSHOT_SEC = 300
+
+# ---- auto trading (paper) ----
+AUTO_TRADE_PCT = 0.05       # each auto entry uses 5% of equity
+AUTO_MAX_POSITIONS = 4
+AUTO_COOLDOWN_SEC = 1800    # no new auto trade on a symbol within 30 min of its last trade
+MIN_EMA_GAP = 0.0005        # EMA9 vs EMA21 must differ by 0.05% to count as a trend
 
 CACHE = {}       # symbol -> {price, source, bar_ts}
 SIGNALS = {}     # symbol -> cached agent decision
+LAST_ANALYSIS = {"ts": 0.0}
 LOCK = threading.Lock()
 TRADE_LOCK = threading.Lock()
 STOP = threading.Event()
@@ -74,9 +82,29 @@ def init():
                      side TEXT, qty REAL, price REAL, fee REAL, pnl REAL DEFAULT 0, strategy TEXT)""")
         c.execute("CREATE TABLE IF NOT EXISTS positions(symbol TEXT PRIMARY KEY, qty REAL, avg REAL)")
         c.execute("CREATE TABLE IF NOT EXISTS equity(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, equity REAL)")
+        c.execute("CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS bot_log(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, symbol TEXT, action TEXT, msg TEXT)")
 
 
 init()
+
+
+def get_setting(k, default=""):
+    with db() as c:
+        r = c.execute("SELECT v FROM settings WHERE k=?", (k,)).fetchone()
+    return r["v"] if r else default
+
+
+def set_setting(k, v):
+    with db() as c:
+        c.execute("INSERT OR REPLACE INTO settings VALUES(?,?)", (k, str(v)))
+
+
+def bot_log(symbol, action, msg):
+    with db() as c:
+        c.execute("INSERT INTO bot_log(ts,symbol,action,msg) VALUES(?,?,?,?)",
+                  (datetime.now(timezone.utc).isoformat(), symbol, action, msg))
+        c.execute("DELETE FROM bot_log WHERE id NOT IN (SELECT id FROM bot_log ORDER BY id DESC LIMIT 200)")
 
 
 # ----------------------------------------------------------------------- prices
@@ -162,8 +190,9 @@ def market_snapshot():
 
 # ---------------------------------------------------------------------- signals
 def indicators(symbol):
+    """5-minute bars, blended with the latest live price so the analysis reacts in near real time."""
     try:
-        hist = yf.Ticker(symbol).history(period="5d", interval="15m")
+        hist = yf.Ticker(symbol).history(period="2d", interval="5m")
         if len(hist) < 30:
             return None
         close = hist["Close"]
@@ -171,39 +200,54 @@ def indicators(symbol):
         gain = float(delta.clip(lower=0).rolling(14).mean().iloc[-1])
         loss = float((-delta.clip(upper=0)).rolling(14).mean().iloc[-1])
         rsi = 100.0 if loss == 0 else 100 - 100 / (1 + gain / loss)
-        return {"last": float(close.iloc[-1]), "ema9": float(close.ewm(span=9).mean().iloc[-1]),
-                "ema21": float(close.ewm(span=21).mean().iloc[-1]), "rsi": rsi}
+        ema9 = float(close.ewm(span=9).mean().iloc[-1])
+        ema21 = float(close.ewm(span=21).mean().iloc[-1])
+        last = float(close.iloc[-1])
+        q = quote(symbol)
+        if q and q["status"] == "live":  # fold the live tick into the EMAs
+            last = q["price"]
+            ema9 = last * (2 / 10) + ema9 * (1 - 2 / 10)
+            ema21 = last * (2 / 22) + ema21 * (1 - 2 / 22)
+        return {"last": last, "ema9": ema9, "ema21": ema21, "rsi": rsi}
     except Exception as e:
         log.warning("indicators %s failed: %s", symbol, e)
         return None
 
 
+def rule_signal(ind):
+    """Trend filter: BUY on a clear uptrend that is not overbought; SELL (exit) on a downtrend or RSI>75."""
+    gap = (ind["ema9"] - ind["ema21"]) / ind["ema21"] if ind["ema21"] else 0.0
+    rsi = ind["rsi"]
+    trend = "ขาขึ้น" if gap > MIN_EMA_GAP else "ขาลง" if gap < -MIN_EMA_GAP else "ไม่ชัด"
+    if gap > MIN_EMA_GAP and ind["last"] > ind["ema21"] and 45 <= rsi <= 68:
+        sig, why = "BUY", "แนวโน้มขาขึ้น และ RSI ยังไม่ Overbought"
+    elif gap < -MIN_EMA_GAP or rsi > 75:
+        sig, why = "SELL", "แนวโน้มขาลง" if gap < -MIN_EMA_GAP else "RSI สูงกว่า 75 (Overbought)"
+    else:
+        sig, why = "WAIT", "ยังไม่เข้าเงื่อนไข (แนวโน้ม/RSI)"
+    conf = 50 if sig == "WAIT" else 55 + min(30, int(abs(gap) * 10000))
+    return sig, conf, f"{why} · EMA gap {gap * 100:+.2f}% · RSI {rsi:.0f}", trend
+
+
 def agent_decision(symbol):
     ind = indicators(symbol)
-    base_agents = {"scout": "รอข้อมูล", "analyst": "ไม่พบข้อมูลพอ", "strategy": "ยังไม่เลือก", "risk": ""}
+    now = time.time()
     if not ind:
-        return {"symbol": symbol, "signal": "WAIT", "confidence": 0, "strategy": "none",
-                "reason": "ข้อมูลย้อนหลังไม่เพียงพอ", "agents": base_agents}
-    score, reasons = 0, []
-    if ind["ema9"] > ind["ema21"]:
-        score += 1; reasons.append("EMA 9 อยู่เหนือ EMA 21")
-    else:
-        score -= 1; reasons.append("EMA 9 อยู่ใต้ EMA 21")
-    if ind["rsi"] < 35:
-        score += 1; reasons.append("RSI ต่ำกว่า 35")
-    elif ind["rsi"] > 70:
-        score -= 1; reasons.append("RSI สูงกว่า 70")
-    sig, conf = ("BUY", 72) if score >= 2 else ("SELL", 72) if score <= -2 else ("WAIT", 50)
-    return {"symbol": symbol, "signal": sig, "confidence": conf, "strategy": "swing/day filter",
-            "reason": "; ".join(reasons),
+        return {"symbol": symbol, "signal": "WAIT", "confidence": 0, "strategy": "none", "computed_at": now,
+                "reason": "ข้อมูลย้อนหลังไม่เพียงพอ",
+                "agents": {"scout": "รอข้อมูล", "analyst": "ไม่พบข้อมูลพอ", "strategy": "ยังไม่เลือก", "risk": ""}}
+    sig, conf, reason, trend = rule_signal(ind)
+    return {"symbol": symbol, "signal": sig, "confidence": conf, "strategy": "trend-follow 5m", "computed_at": now,
+            "reason": reason,
             "indicators": {"rsi": round(ind["rsi"], 1), "ema9": round(ind["ema9"], 4), "ema21": round(ind["ema21"], 4)},
-            "agents": {"scout": "รวบรวมข้อมูลสำเร็จ", "analyst": f"RSI {ind['rsi']:.1f} · EMA trend",
-                       "strategy": "ประเมินแนวโน้มระยะสั้น/กลาง", "risk": ""}}
+            "agents": {"scout": "ดึงแท่ง 5 นาที + ราคา live", "analyst": f"RSI {ind['rsi']:.0f} · แนวโน้ม{trend}",
+                       "strategy": "Trend-follow (EMA9/21 + RSI)", "risk": ""}}
 
 
 def refresh_signals():
     for s in SYMBOLS:
         SIGNALS[s] = agent_decision(s)
+    LAST_ANALYSIS["ts"] = time.time()
 
 
 # -------------------------------------------------------------------- portfolio
@@ -293,7 +337,7 @@ def check_exits():
         if reason:
             try:
                 execute_trade(p["symbol"], "SELL", p["qty"], reason, p["price"], enforce_risk=False)
-                log.info("%s %s @ %s", reason, p["symbol"], p["price"])
+                bot_log(p["symbol"], reason, f"ปิดสถานะ {p['symbol']} @ {p['price']:.4f} ({p['pct'] * 100:+.2f}%)")
             except HTTPException as e:
                 log.warning("exit failed %s: %s", p["symbol"], e.detail)
 
@@ -305,20 +349,60 @@ def snapshot_equity():
         c.execute("DELETE FROM equity WHERE id NOT IN (SELECT id FROM equity ORDER BY id DESC LIMIT 2000)")
 
 
+def auto_trade():
+    """Paper-only: open/close positions from the latest fresh signals. Does nothing unless the switch is on."""
+    if get_setting("auto_enabled", "0") != "1":
+        return
+    with db() as c:
+        pf = portfolio(c)
+        last = {r["symbol"]: r["ts"] for r in c.execute("SELECT symbol, MAX(ts) ts FROM trades GROUP BY symbol")}
+    held = {p["symbol"]: p for p in pf["positions"]}
+    cash = pf["cash"]
+    for sym in SYMBOLS:
+        d = SIGNALS.get(sym)
+        if not d or d["signal"] == "WAIT" or time.time() - d.get("computed_at", 0) > 3 * SIGNAL_LOOP_SEC:
+            continue
+        q = quote(sym)
+        if not q or q["status"] != "live":
+            continue
+        lt = last.get(sym)
+        if lt and time.time() - datetime.fromisoformat(lt).timestamp() < AUTO_COOLDOWN_SEC:
+            continue
+        try:
+            if d["signal"] == "BUY" and sym not in held:
+                if len(held) >= AUTO_MAX_POSITIONS:
+                    continue
+                spend = min(pf["equity"] * AUTO_TRADE_PCT, cash * 0.98)
+                if spend < 10:
+                    continue
+                qty = spend / q["price"]
+                execute_trade(sym, "BUY", qty, "auto:" + d["strategy"], q["price"])
+                held[sym] = {"qty": qty}
+                cash -= spend * (1 + FEE_RATE)
+                bot_log(sym, "BUY", f"ซื้อ {qty:.6g} @ {q['price']:.4f} · {d['reason']}")
+            elif d["signal"] == "SELL" and sym in held:
+                execute_trade(sym, "SELL", held[sym]["qty"], "auto:exit", q["price"], enforce_risk=False)
+                del held[sym]
+                bot_log(sym, "SELL", f"ปิดสถานะ @ {q['price']:.4f} · {d['reason']}")
+        except HTTPException as e:
+            bot_log(sym, "skip", f"ไม่ส่งคำสั่ง: {e.detail}")
+
+
 def worker():
-    last_sig = last_snap = 0.0
+    t_price = t_sig = t_snap = 0.0
     while not STOP.is_set():
         try:
-            refresh_prices()
+            if time.time() - t_price >= PRICE_LOOP_SEC:
+                refresh_prices(); t_price = time.time()
             check_exits()
-            t = time.time()
-            if t - last_snap >= SNAPSHOT_SEC:
-                snapshot_equity(); last_snap = t
-            if t - last_sig >= SIGNAL_LOOP_SEC:
-                refresh_signals(); last_sig = time.time()
+            if time.time() - t_snap >= SNAPSHOT_SEC:
+                snapshot_equity(); t_snap = time.time()
+            if time.time() - t_sig >= SIGNAL_LOOP_SEC:
+                refresh_signals(); t_sig = time.time()
+                auto_trade()
         except Exception:
             log.exception("worker error")
-        STOP.wait(PRICE_LOOP_SEC)
+        STOP.wait(TICK_SEC)
 
 
 # -------------------------------------------------------------------------- api
@@ -332,7 +416,7 @@ async def lifespan(_app):
     task.cancel()
 
 
-app = FastAPI(title="AI Trading Desk PRO Phase 2.1", lifespan=lifespan)
+app = FastAPI(title="AI Trading Desk PRO Phase 3", lifespan=lifespan)
 # Works with either layout: files inside ./static/ or all files flat next to app.py
 # (flat is easier to upload from a phone). Only this allowlist is ever served.
 STATIC_DIR = ROOT / "static" if (ROOT / "static").is_dir() else ROOT
@@ -393,6 +477,7 @@ def signals():
                                     "reason": "กำลังโหลดข้อมูล…",
                                     "agents": {"scout": "กำลังโหลด", "analyst": "-", "strategy": "-", "risk": ""}})
         d["agents"] = dict(d["agents"])
+        d["age"] = int(time.time() - d["computed_at"]) if d.get("computed_at") else None
         d["agents"]["risk"], d["risk_ok"] = risk_text(d["signal"], s, pf)
         out.append(d)
     return {"signals": out}
@@ -416,6 +501,29 @@ def equity_curve():
     return {"points": [dict(r) for r in reversed(rows)]}
 
 
+class BotSwitch(BaseModel):
+    enabled: bool
+
+
+@api.get("/bot")
+def bot_status():
+    with db() as c:
+        rows = c.execute("SELECT ts,symbol,action,msg FROM bot_log ORDER BY id DESC LIMIT 30").fetchall()
+    la = LAST_ANALYSIS["ts"]
+    return {"enabled": get_setting("auto_enabled", "0") == "1",
+            "analysis_age": int(time.time() - la) if la else None,
+            "params": {"trade_pct": AUTO_TRADE_PCT, "max_positions": AUTO_MAX_POSITIONS,
+                       "cooldown_min": AUTO_COOLDOWN_SEC // 60, "interval_sec": SIGNAL_LOOP_SEC},
+            "log": [dict(r) for r in rows]}
+
+
+@api.post("/bot")
+def bot_switch(b: BotSwitch):
+    set_setting("auto_enabled", "1" if b.enabled else "0")
+    bot_log("-", "system", "เปิด Auto Trading (บัญชีจำลอง)" if b.enabled else "ปิด Auto Trading")
+    return {"enabled": b.enabled}
+
+
 @api.post("/trade")
 def trade(o: Order):
     side = o.side.upper()
@@ -436,6 +544,7 @@ def reset():
         c.execute("DELETE FROM positions")
         c.execute("DELETE FROM trades")
         c.execute("DELETE FROM equity")
+        c.execute("DELETE FROM bot_log")
     return {"ok": True}
 
 

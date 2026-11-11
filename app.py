@@ -19,6 +19,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
@@ -64,6 +65,7 @@ MAX_DRAWDOWN_PCT = 0.20     # no new BUY once equity is down 20%
 AUTO_MAX_POSITIONS = 5
 AUTO_COOLDOWN_SEC = 1800
 MIN_ORDER_USD = 1.0
+TARGET_PCT = 0.15           # Charts bot: indicative target shown in chat (+15%, same level trailing starts)
 
 # ---- filter / analyst thresholds ----
 MAX_SPREAD_PCT = 0.001      # 0.10%
@@ -97,6 +99,20 @@ PIPE = {"ts": 0.0, "cycle": 0, "auto": False, "counts": {"scout": 0, "filter": 0
 LOCK = threading.Lock()
 TRADE_LOCK = threading.Lock()
 STOP = threading.Event()
+
+# ---- Trading Floor: six bots talking in one group chat (all paper trading) ----
+BOTS = ["Chief", "Scout", "News", "Sentiment", "Charts", "Skeptic"]
+DESK = {"started": time.time(), "seq": 0, "msgs": deque(maxlen=150), "last": {}, "sum": None}
+DESK_LOCK = threading.Lock()
+DESK_REPEAT_SEC = 900       # same symbol is discussed again after 15 min (or when the verdict flips)
+SKEPTIC_VETO_AT = 3         # Skeptic blocks an entry when it finds this many objections
+
+
+def say(bot, text, symbol="", tone=""):
+    with DESK_LOCK:
+        DESK["seq"] += 1
+        DESK["msgs"].append({"id": DESK["seq"], "ts": datetime.now(timezone.utc).isoformat(), "bot": bot,
+                             "symbol": symbol, "text": text, "tone": tone})
 
 
 # --------------------------------------------------------------------------- db
@@ -630,6 +646,62 @@ def risk_plan(pf, symbol, px):
     return {"stop": px * (1 - STOP_LOSS_PCT), "max_value": min(pf["equity"] * MAX_TRADE_PCT, room)}, ""
 
 
+def skeptic_review(cand, d, ind, score, rules):
+    """Skeptic bot: argues against every trade. Returns (objections, veto)."""
+    obj = []
+    if ind["rsi"] > 65:
+        obj.append(f"RSI {ind['rsi']:.0f} เริ่มร้อนแรง")
+    vr = d.get("vol_ratio")
+    if vr is not None and vr < 1.3:
+        obj.append(f"วอลุ่มแค่ {vr:.2f}× ยังไม่หนุนแรง")
+    unk = sum(r["status"] == "unknown" for r in rules)
+    if unk >= 3:
+        obj.append(f"ตรวจข้อมูลไม่ได้ {unk} จาก 6 กฎ")
+    if score < 0.7:
+        obj.append(f"คะแนน {score:.2f} ไม่สูงมาก")
+    chg = cand.get("chg24")
+    if chg is not None and chg > 8:
+        obj.append(f"ขึ้นมาแล้ว {chg:+.1f}% ใน 24 ชม. เสี่ยงไล่ราคา")
+    return obj, len(obj) >= SKEPTIC_VETO_AT
+
+
+def desk_talk(cand, d, ind, score, obj, veto, auto, px, talk):
+    """The six bots discuss one candidate in the group chat (rate-limited per symbol)."""
+    sym = cand["symbol"]
+    prev = DESK["last"].get(sym)
+    if not talk or (prev and time.time() - prev[0] < DESK_REPEAT_SEC and prev[1] == veto):
+        return
+    DESK["last"][sym] = (time.time(), veto)
+    chg, vol, vr = cand.get("chg24"), cand.get("vol24"), d.get("vol_ratio")
+    say("Scout", f"เจอ {sym} @ {px:.6g}" + (f" · 24 ชม. {chg:+.1f}%" if chg is not None else "") +
+        (f" · วอลุ่ม ${vol / 1e6:.1f}M" if vol else ""), sym)
+    nw = d.get("news")
+    if nw is None:
+        say("News", "ดึงข่าวไม่ได้ ยังยืนยันไม่ได้ว่าปลอดภัย", sym, "warn")
+    else:
+        say("News", f"ไม่พบข่าวเสี่ยงใน {NEWS_LOOKBACK_H} ชม. (จับคำสำคัญในพาดหัว ไม่ได้อ่านเนื้อข่าว)", sym, "ok")
+    if vr is not None and vr >= 2 and chg is not None and chg > 3:
+        mood, tone = f"ฝูงชนกำลังแห่ซื้อ (วอลุ่ม {vr:.1f}×, {chg:+.1f}%) ระวัง FOMO", "warn"
+    elif vr is not None and vr >= 1:
+        mood, tone = f"ความสนใจปกติถึงเพิ่มขึ้น (วอลุ่ม {vr:.1f}×)", "ok"
+    else:
+        mood, tone = "ฝูงชนยังเงียบ ไม่มีข้อมูลวอลุ่มเทียบ", "warn"
+    say("Sentiment", mood + " · ประเมินจากวอลุ่ม/ราคา ไม่ได้อ่านโซเชียล", sym, tone)
+    gap = (ind["ema9"] - ind["ema21"]) / ind["ema21"] if ind["ema21"] else 0.0
+    say("Charts", f"เข้า {px:.6g} · stop {px * (1 - STOP_LOSS_PCT):.6g} (-{STOP_LOSS_PCT:.0%}) · "
+        f"เป้า {px * (1 + TARGET_PCT):.6g} (+{TARGET_PCT:.0%}) · EMA gap {gap * 100:+.2f}% · RSI {ind['rsi']:.0f}", sym)
+    if obj:
+        say("Skeptic", "ค้านนะ: " + "; ".join(obj) + (" → VETO" if veto else " → ยังพอรับได้"), sym, "bad" if veto else "warn")
+    else:
+        say("Skeptic", "หาจุดค้านไม่เจอรอบนี้", sym, "ok")
+    if veto:
+        say("Chief", f"ตัดสิน: ข้าม {sym} ตาม Skeptic (ค้าน {len(obj)} ข้อ)", sym, "bad")
+    elif auto:
+        say("Chief", f"ตัดสิน: เข้า {sym} คะแนน {score:.2f} → ส่งให้ Risk/Executor", sym, "ok")
+    else:
+        say("Chief", f"ตัดสิน: {sym} ผ่านทีม (คะแนน {score:.2f}) แต่ Auto ปิดอยู่ จึงยังไม่ส่งคำสั่ง", sym)
+
+
 def _kill(row, agent, reason, log_it=True):
     row["verdict"] = "killed"
     row["killed_by"] = agent
@@ -682,6 +754,7 @@ def run_cycle(cands=None, gather=None, ind_fn=None):
                 try:
                     execute_trade(sym, "SELL", p["qty"], "auto:trend-exit", q["price"], enforce_risk=False)
                     bot_log("Executor", sym, "SELL", f"ปิดสถานะ @ {q['price']:.6g} · {rule_signal(ind)[2]}")
+                    say("Chief", f"ปิด {sym} @ {q['price']:.6g} · {rule_signal(ind)[2]}", sym, "warn")
                     row.update(verdict="exit", note="ปิดสถานะตามสัญญาณ")
                     n_exec += 1
                     held.pop(sym)
@@ -711,12 +784,18 @@ def run_cycle(cands=None, gather=None, ind_fn=None):
         row["note"] = why
         n_analyst += 1
         LAST_KILL.pop(sym, None)
-        ranked.append((score, cand, row))
+        ranked.append((score, cand, row, d, ind))
 
     cash = pf["cash"]
-    for score, cand, row in sorted(ranked, key=lambda x: -x[0]):
+    for n_rank, (score, cand, row, d, ind) in enumerate(sorted(ranked, key=lambda x: -x[0])):
         sym = cand["symbol"]
         q = quote(sym)
+        objections, veto = skeptic_review(cand, d, ind, score, row["rules"])
+        desk_talk(cand, d, ind, score, objections, veto, auto, q["price"], n_rank < 4)
+        if veto:
+            row["stage"] = "skeptic"
+            _kill(row, "Skeptic", "ค้าน: " + "; ".join(objections))
+            continue
         row["stage"] = "executor"
         if not auto:
             row["note"] += " · Auto ปิดอยู่ จึงไม่ส่งคำสั่ง"
@@ -747,11 +826,17 @@ def run_cycle(cands=None, gather=None, ind_fn=None):
         n_exec += 1
         row.update(verdict="bought", note=f"ซื้อ {qty:.6g} @ {q['price']:.6g} · stop {plan['stop']:.6g} (-{STOP_LOSS_PCT:.0%})")
         bot_log("Executor", sym, "BUY", f"คะแนน {score:.2f} · ซื้อ {qty:.6g} @ {q['price']:.6g} · Risk ตั้ง stop {plan['stop']:.6g}")
+        say("Chief", f"ซื้อ {sym} {qty:.6g} @ {q['price']:.6g} · stop {plan['stop']:.6g}", sym, "ok")
 
     order = {"bought": 0, "exit": 1, "held": 2, "passed": 3, "killed": 4}
     rows.sort(key=lambda r: (order.get(r["verdict"], 5), -(r["score"] or 0)))
     PIPE.update(ts=time.time(), cycle=PIPE["cycle"] + 1, auto=auto, rows=rows,
                 counts={"scout": len(cands), "filter": n_filter, "analyst": n_analyst, "executor": n_exec})
+    sig = (len(cands), n_filter, n_analyst, n_exec)
+    if DESK["sum"] != sig or PIPE["cycle"] % 10 == 1:
+        say("Chief", f"รอบ #{PIPE['cycle']}: สแกน {sig[0]} → ผ่าน Filter {sig[1]} → ผ่าน Analyst {sig[2]} → ส่งคำสั่ง {sig[3]}" +
+            ("" if auto else " · Auto ปิดอยู่"))
+        DESK["sum"] = sig
     return PIPE
 
 
@@ -849,6 +934,7 @@ def check_exits():
                 execute_trade(p["symbol"], "SELL", p["qty"], "trailing-stop" if trail else "stop-loss", px, enforce_risk=False)
                 bot_log("Risk", p["symbol"], "trailing-stop" if trail else "stop-loss",
                         f"ปิดสถานะ {p['symbol']} @ {px:.6g} (stop {stop:.6g})")
+                say("Chief", f"{'Trailing stop' if trail else 'Stop-loss'} ทำงาน ปิด {p['symbol']} @ {px:.6g}", p["symbol"], "bad")
             except HTTPException as e:
                 log.warning("exit failed %s: %s", p["symbol"], e.detail)
 
@@ -896,7 +982,7 @@ async def lifespan(_app):
     task.cancel()
 
 
-app = FastAPI(title="AI Trading Desk PRO Phase 4", lifespan=lifespan)
+app = FastAPI(title="AI Trading Desk PRO Phase 5", lifespan=lifespan)
 
 # Works with either layout: files inside ./static/ or all files flat next to app.py
 # (flat is easier to upload from a phone). Only this allowlist is ever served.
@@ -957,6 +1043,22 @@ def pipeline():
     return {"cycle": PIPE["cycle"], "age": int(time.time() - PIPE["ts"]) if PIPE["ts"] else None, "auto": PIPE["auto"],
             "counts": PIPE["counts"], "rows": PIPE["rows"], "scout_error": SCOUT_ERR.get("crypto"),
             "analyst_min": ANALYST_MIN}
+
+
+@api.get("/desk")
+def desk():
+    now = time.time()
+    with db() as c:
+        pf = portfolio(c)
+        sells = [r["pnl"] for r in c.execute("SELECT pnl FROM trades WHERE side='SELL'")]
+    spoke = {}
+    for m in list(DESK["msgs"]):
+        spoke[m["bot"]] = datetime.fromisoformat(m["ts"]).timestamp()
+    alive = bool(PIPE["ts"]) and now - PIPE["ts"] < PIPELINE_SEC * 3
+    bots = [{"bot": b, "state": "online" if (b == "Chief" and alive) or now - spoke.get(b, 0) < 120 else "idle"} for b in BOTS]
+    return {"bots": bots, "messages": list(DESK["msgs"])[-60:], "uptime": int(now - DESK["started"]),
+            "cycle": PIPE["cycle"], "equity": pf["equity"], "pnl": pf["equity"] - pf["initial"],
+            "closed": len(sells), "win_rate": (sum(1 for x in sells if x > 0) / len(sells)) if sells else None}
 
 
 @api.get("/account")

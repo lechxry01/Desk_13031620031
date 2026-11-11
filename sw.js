@@ -1,4 +1,4 @@
-const C = "trading-desk-v3";
+const C = "trading-desk-v4";
 const ASSETS = ["/", "/static/style.css", "/static/app.js", "/static/manifest.json", "/static/icon-192.png"];
 self.addEventListener("install", e => { e.waitUntil(caches.open(C).then(c => c.addAll(ASSETS))); self.skipWaiting(); });
 self.addEventListener("activate", e => {

@@ -15,13 +15,20 @@
 <title>AI Trading Desk PRO</title>
 </head>
 <body>
-<header><div><small>SIMULATION ONLY · PHASE 4</small><h1>AI Trading Desk <b>PRO</b></h1></div><span class="live">● PAPER MODE</span></header>
+<header><div><small>SIMULATION ONLY · PHASE 5</small><h1>AI Trading Desk <b>PRO</b></h1></div><span class="live">● PAPER MODE</span></header>
 <div id="halt" class="banner" hidden>⚠ ขาดทุนสะสมเกินกรอบ — ระบบหยุดเปิดสถานะใหม่ (ปิดสถานะได้เท่านั้น)</div>
 <main>
 <section class="stats">
   <article><small>PORTFOLIO VALUE</small><strong id="equity">$10,000.00</strong></article>
   <article><small>AVAILABLE CASH</small><strong id="cash">$10,000.00</strong></article>
   <article><small>NET P/L</small><strong id="pnl">$0.00</strong></article>
+</section>
+<section class="panel">
+  <div class="heading"><h2>🏢 Trading Floor</h2><span class="muted" id="floorage">6 bots · 1 chat</span></div>
+  <div class="surv" id="surv"></div>
+  <div class="bots" id="bots"></div>
+  <div class="chat" id="chat"><div class="empty">รอทีมบอทเริ่มคุยรอบแรก…</div></div>
+  <small class="muted">บอททั้ง 6 คุยกันจากข้อมูลจริงของระบบ (ราคา/วอลุ่ม/ข่าว/อินดิเคเตอร์) · Sentiment เป็น proxy ไม่ได้อ่านโซเชียล · Skeptic ค้านได้ ถ้าค้าน ≥ 3 ข้อจะบล็อกการเข้า · เงินจำลองเท่านั้น</small>
 </section>
 <section class="panel">
   <div class="heading"><h2>🤖 Auto Trading</h2>
@@ -38,7 +45,7 @@
 <section class="panel">
   <div class="heading"><h2>Agent Pipeline</h2><span class="muted" id="pipeage">กำลังเริ่ม…</span></div>
   <div id="pipeflow" class="flow"></div>
-  <small class="muted">Scout หาตัวเลือก → Filter ตัดตัวที่ไม่ผ่าน 6 กฎ → Analyst ให้คะแนน 0–1 (ต่ำกว่าเกณฑ์ถูกตัด) → Risk ตั้ง stop ก่อนเข้า → Executor ส่งคำสั่ง → Logger บันทึกทุกการตัดออก</small>
+  <small class="muted">Scout หาตัวเลือก → Filter ตัดตัวที่ไม่ผ่าน 6 กฎ → Analyst ให้คะแนน 0–1 (ต่ำกว่าเกณฑ์ถูกตัด) → Skeptic ค้าน (ถ้าค้านมากถูกบล็อก) → Risk ตั้ง stop ก่อนเข้า → Executor ส่งคำสั่ง → Logger บันทึกทุกการตัดออก</small>
   <div id="pipelist"></div>
 </section>
 <section class="panel">
@@ -58,6 +65,7 @@
 </section>
 </main>
 <footer>ข้อมูลตลาดอาจล่าช้า · Paper trading เท่านั้น · อย่าใช้เป็นคำแนะนำลงทุน</footer>
+<div id="fill"></div>
 <div id="toast"></div>
 <script src="/static/app.js"></script>
 </body>

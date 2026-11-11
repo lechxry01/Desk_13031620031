@@ -1,4 +1,8 @@
-# AI Trading Desk PRO – Phase 4 (6 Agents)
+# AI Trading Desk PRO – Phase 5 (Trading Floor: 6 บอทคุยกันในแชทเดียว)
+
+Phase 5 เพิ่มห้องแชท Chief/Scout/News/Sentiment/Charts/Skeptic, แดชบอร์ด Survival (balance, P/L, win rate, uptime) และการ์ด BIG FILL — Skeptic ค้านได้และบล็อกการเข้าเมื่อค้าน ≥ 3 ข้อ · Sentiment เป็น proxy จากวอลุ่ม/ราคา ไม่ได้อ่านโซเชียล · ประวัติแชทอยู่ในหน่วยความจำ หายเมื่อเซิร์ฟเวอร์รีสตาร์ท
+
+# (ของเดิม) Phase 4 – 6 Agents
 
 ระบบทดลอง Paper Trading สำหรับมือถือ เงินจำลองเริ่มต้น $10,000 (เปลี่ยนได้ด้วยตัวแปร `START_CASH` เช่น `50` แล้วกดรีเซ็ตบัญชี)
 **ไม่มีการเชื่อมต่อบัญชีเงินจริง และไม่เชื่อมกับ MT5/XM**

@@ -3,7 +3,7 @@ const money = n => "$" + Number(n || 0).toLocaleString("en-US", {minimumFraction
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
 const pct = n => (n >= 0 ? "+" : "") + (n * 100).toFixed(2) + "%";
 let KEY = localStorage.getItem("appkey") || "";
-let ACCOUNT = null, PRICES = {}, PICK = null, busy = false, asking = null, tick = 0;
+let SEEN = null, CHATLAST = 0, ACCOUNT = null, PRICES = {}, PICK = null, busy = false, asking = null, tick = 0;
 
 function toast(msg, kind = "info") {
   const t = $("toast");
@@ -57,6 +57,40 @@ function renderMarket(items) {
     sel.innerHTML = items.map(x => `<option>${esc(x.symbol)}</option>`).join("");
     if (cur) sel.value = cur;
   }
+}
+
+const BOTC = {Chief: ["#f26a1b", "50% 0 50% 50%"], Scout: ["#f7931e", "42%"], News: ["#2b7bff", "14px"],
+  Sentiment: ["#e5384f", "38% 62% 45% 55%"], Charts: ["#8b5cf6", "50% 50% 40% 60%"], Skeptic: ["#8b95a5", "24px 24px 10px 10px"]};
+const blob = (b, sm) => `<span class="blob${sm ? " sm" : ""}" style="--c:${(BOTC[b] || ["#888"])[0]};--r:${(BOTC[b] || [0, "50%"])[1]}"></span>`;
+
+function hms(s) { return Math.floor(s / 3600) + "h " + String(Math.floor(s % 3600 / 60)).padStart(2, "0") + "m"; }
+
+function renderDesk(d) {
+  const wr = d.win_rate == null ? "—" : (d.win_rate * 100).toFixed(1) + "%";
+  $("surv").innerHTML = `<div><small>BALANCE</small><strong>${money(d.equity)}</strong></div>
+    <div><small>TOTAL P/L</small><strong class="${d.pnl >= 0 ? "buy" : "sell"}">${(d.pnl >= 0 ? "+" : "") + money(d.pnl)}</strong></div>
+    <div><small>WIN RATE</small><strong>${wr}</strong><small>${d.closed} ไม้ปิด</small></div>
+    <div><small>UPTIME · CYCLE</small><strong>${hms(d.uptime)}</strong><small>รอบ ${d.cycle}</small></div>`;
+  $("bots").innerHTML = d.bots.map(x => `<div class="bot">${blob(x.bot)}<b>${x.bot.toUpperCase()}</b><i class="${x.state}">${x.state}</i></div>`).join("");
+  const box = $("chat"), last = d.messages.length ? d.messages[d.messages.length - 1].id : 0;
+  if (!d.messages.length) return;
+  if (last !== CHATLAST) {
+    const near = box.scrollHeight - box.scrollTop - box.clientHeight < 80 || !CHATLAST;
+    box.innerHTML = d.messages.map(m => `<div class="msg">${blob(m.bot, true)}<div class="bub ${esc(m.tone)}" style="--c:${(BOTC[m.bot] || ["#aaa"])[0]}">
+      <b>${esc(m.bot)}</b>${m.symbol ? ` · <span class="muted">${esc(m.symbol)}</span>` : ""} <span class="muted">· ${ago(m.ts)}</span><div>${esc(m.text)}</div></div></div>`).join("");
+    if (near) box.scrollTop = box.scrollHeight;
+    CHATLAST = last;
+  }
+  $("floorage").textContent = d.bots.filter(x => x.state === "online").length + " online · รอบ " + d.cycle;
+}
+
+function fillCard(t) {
+  const el = $("fill"), sell = t.side === "SELL";
+  el.innerHTML = `<small>${sell ? "POSITION CLOSED" : "BIG FILL"} · ${esc(t.side)}</small><strong>${esc(t.symbol)}</strong>` +
+    (sell ? `<span class="${t.pnl >= 0 ? "pos" : "neg"}">${t.pnl >= 0 ? "+" : ""}${money(t.pnl)}</span>` : `<span>${t.qty} @ ${money(t.price)}</span>`);
+  el.className = "show";
+  clearTimeout(fillCard.t);
+  fillCard.t = setTimeout(() => (el.className = ""), 3500);
 }
 
 const VERDICT = {bought: "🟢 ซื้อแล้ว", exit: "🔴 ปิดสถานะ", held: "📌 ถืออยู่", passed: "✅ ผ่าน", killed: "☠️ ตัดออก"};
@@ -123,6 +157,9 @@ function renderAccount(a) {
   $("pnl").textContent = money(a.pnl);
   $("pnl").className = a.pnl >= 0 ? "buy" : "sell";
   $("halt").hidden = !a.halted;
+  const top = a.trades.length ? a.trades[0].id : 0;
+  if (SEEN === null || top < SEEN) SEEN = top;
+  else if (top > SEEN) { fillCard(a.trades.find(t => t.id > SEEN)); SEEN = top; }
   const L = a.limits;
   $("limits").textContent = `ค่าธรรมเนียมจำลอง ${(L.fee_rate * 100).toFixed(1)}% · ไม้ละ ≤ ${L.max_trade_pct * 100}% · รวมต่อตัว ≤ ${L.max_position_pct * 100}% · Stop -${L.stop_loss_pct * 100}% ตั้งก่อนเข้า · Trailing ${L.trail_pct * 100}% เมื่อกำไร +${L.trail_activate_pct * 100}% · ไม่มีคำสั่งเงินจริง`;
   $("positions").innerHTML = a.positions.length ? a.positions.map(p => `
@@ -139,10 +176,10 @@ async function refresh(manual = false) {
   if (busy || (document.hidden && !manual)) return;
   busy = true;
   try {
-    const calls = [api("/api/market"), api("/api/pipeline"), api("/api/account"), api("/api/bot")];
+    const calls = [api("/api/market"), api("/api/pipeline"), api("/api/account"), api("/api/bot"), api("/api/desk")];
     if (tick++ % 6 === 0 || manual) calls.push(api("/api/equity"));
-    const [m, pl, a, b, e] = await Promise.all(calls);
-    renderMarket(m.items); renderPipeline(pl); renderAccount(a); renderBot(b);
+    const [m, pl, a, b, dk, e] = await Promise.all(calls);
+    renderMarket(m.items); renderPipeline(pl); renderAccount(a); renderBot(b); renderDesk(dk);
     if (e) spark(e.points);
   } catch (err) { toast(err.message, "err"); }
   finally { busy = false; }

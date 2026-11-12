@@ -74,6 +74,12 @@ NEWS_MODEL = os.getenv("NEWS_MODEL", "claude-haiku-5-5")   # used only when ANTH
 NEWS_NEG_AT = -0.3          # Skeptic objects when the news tone is at or below this
 SEC_CONTACT = os.getenv("SEC_CONTACT", "").strip()   # required by SEC fair access, e.g. "AI Trading Desk you@email.com"
 SEC_DAYS = 3                # look at 8-Ks filed in the last N days
+TM_DAYS = 30                # Time Machine: replay the entry/exit rules over the last N days of 5-minute bars
+TM_MIN_TRADES = 8           # fewer replayed trades than this = sample too small to judge
+TM_COOLDOWN_BARS = 6        # 30 minutes (6 x 5m) after an exit before re-entering, like the live cooldown
+TM_ERR = {}
+SB_MIN_N = 20               # Skeptic scoreboard: samples needed on EACH side before it says anything
+SB_LAST = {}
 TARGET_PCT = 0.15           # Charts bot: indicative target shown in chat (+15%, same level trailing starts)
 
 # ---- filter / analyst thresholds ----
@@ -133,7 +139,7 @@ TRADE_LOCK = threading.Lock()
 STOP = threading.Event()
 
 # ---- Trading Floor: six bots talking in one group chat (all paper trading) ----
-BOTS = ["Chief", "Scout", "News", "Sentiment", "Charts", "Skeptic"]
+BOTS = ["Chief", "Scout", "News", "Sentiment", "Charts", "Time Machine", "Skeptic"]
 DESK = {"started": time.time(), "seq": 0, "msgs": deque(maxlen=150), "last": {}, "sum": None, "mode": "normal"}
 DESK_LOCK = threading.Lock()
 DESK_REPEAT_SEC = 900       # same symbol is discussed again after 15 min (or when the verdict flips)
@@ -199,6 +205,7 @@ def init():
         c.execute("CREATE TABLE IF NOT EXISTS equity(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, equity REAL)")
         c.execute("CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS news_tone(id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, symbol TEXT, score REAL, n INTEGER, topics TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS decisions(id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, symbol TEXT, verdict TEXT, price REAL, n_obj INTEGER, r4h REAL, r24h REAL)")
         c.execute("CREATE TABLE IF NOT EXISTS bot_log(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, symbol TEXT, action TEXT, msg TEXT)")
         for table, col, ddl in [("positions", "stop", "REAL"), ("positions", "peak", "REAL"),
                                 ("positions", "trail", "INTEGER DEFAULT 0"), ("bot_log", "agent", "TEXT")]:
@@ -806,6 +813,113 @@ def news_read(symbol):
             "source": "AI" if ai else "คีย์เวิร์ด", "topics": topics, "delta": delta}
 
 
+def binance_history(sym, days=TM_DAYS):
+    end = int(time.time() * 1000)
+    t, out = end - days * 86400 * 1000, []
+    while t < end and len(out) < 9500:
+        rows = binance_get(f"/api/v3/klines?symbol={CRYPTO[sym]}&interval=5m&startTime={t}&limit=1000")
+        if not rows:
+            break
+        out += [(r[0] / 1000, float(r[4])) for r in rows]
+        t = rows[-1][0] + 300_000
+        if len(rows) < 1000:
+            break
+    return out
+
+
+def history_5m(symbol, days=TM_DAYS):
+    src = []
+    if symbol in CRYPTO:
+        src.append(("Binance", lambda: binance_history(symbol, days)))
+    src += [("Yahoo", lambda: yahoo_chart(symbol, "5m", "1mo")), ("yfinance", lambda: yf_series(symbol, "5m", "1mo"))]
+    return try_sources(src, 600, TM_ERR, symbol)[1]
+
+
+def backtest(pts, fee=FEE_RATE):
+    """Time Machine core: replays the live technical rules (EMA9/21 + RSI entry, trend/RSI exit, -8% stop, +15% trailing)
+    over past 5-minute closes. Sizes are equal, fees are charged both ways. News / volume / SEC filters are NOT replayed."""
+    close = pd.Series([c for _, c in pts], dtype="float64")
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rsi = (100 - 100 / (1 + gain / loss)).where(loss != 0, 100.0)
+    ema9, ema21 = close.ewm(span=9).mean(), close.ewm(span=21).mean()
+    gap = ((ema9 - ema21) / ema21).values
+    c, r, e21 = close.values, rsi.values, ema21.values
+    nets, pos, cool, still_open = [], None, 0, False
+    for i in range(30, len(c)):
+        px = c[i]
+        if pos:
+            pos["peak"] = max(pos["peak"], px)
+            if not pos["trail"] and px / pos["entry"] - 1 >= TRAIL_ACTIVATE_PCT:
+                pos["trail"] = True
+            stop = max(pos["stop"], pos["peak"] * (1 - TRAIL_PCT)) if pos["trail"] else pos["stop"]
+            if px <= stop or gap[i] < -MIN_EMA_GAP or r[i] > 75:
+                nets.append(px * (1 - fee) / (pos["entry"] * (1 + fee)) - 1)
+                pos, cool = None, TM_COOLDOWN_BARS
+        elif cool > 0:
+            cool -= 1
+        elif gap[i] > MIN_EMA_GAP and px > e21[i] and 45 <= r[i] <= 68:
+            pos = {"entry": px, "peak": px, "trail": False, "stop": px * (1 - STOP_LOSS_PCT)}
+    if pos:    # still holding at the end: mark to market
+        nets.append(c[-1] * (1 - fee) / (pos["entry"] * (1 + fee)) - 1)
+        still_open = True
+    n = len(nets)
+    days = (pts[-1][0] - pts[0][0]) / 86400
+    return {"days": int(round(days)), "trades": n, "wins": sum(1 for x in nets if x > 0),
+            "win_rate": (sum(1 for x in nets if x > 0) / n) if n else None,
+            "avg_pct": float(sum(nets) / n * 100) if n else None, "worst_pct": float(min(nets) * 100) if n else None,
+            "total_pct": float(sum(nets) * 100), "hold_pct": float((c[-1] / c[30] - 1) * 100) if len(c) > 31 else 0.0,
+            "open": still_open}
+
+
+def time_machine(symbol):
+    """Time Machine bot: how would today's rules have done on this symbol over the last ~30 days? None = no history."""
+    def run():
+        pts = history_5m(symbol)
+        if not pts:
+            raise RuntimeError(TM_ERR.get(symbol) or "ไม่มีข้อมูลย้อนหลัง")
+        return backtest(pts)
+    try:
+        return cached(("tm", symbol), 6 * 3600, run)
+    except Exception as e:
+        log.warning("time machine %s failed: %s", symbol, short_err(e))
+        return None
+
+
+def record_decision(sym, verdict, px, n_obj):
+    """Skeptic scoreboard: remember every call (veto / pass) with the price, to check later what really happened."""
+    prev = SB_LAST.get(sym)
+    if prev and time.time() - prev[0] < 3600 and prev[1] == verdict:
+        return
+    SB_LAST[sym] = (time.time(), verdict)
+    with db() as c:
+        c.execute("INSERT INTO decisions(ts,symbol,verdict,price,n_obj) VALUES(?,?,?,?,?)", (time.time(), sym, verdict, px, n_obj))
+        c.execute("DELETE FROM decisions WHERE id NOT IN (SELECT id FROM decisions ORDER BY id DESC LIMIT 5000)")
+
+
+def resolve_decisions():
+    """Fill in the price change 4h and 24h after each call (only when the reading lands inside its time window)."""
+    now = time.time()
+    with db() as c:
+        rows = c.execute("SELECT id,ts,symbol,price,r4h,r24h FROM decisions WHERE r24h IS NULL AND ts>?", (now - 48 * 3600,)).fetchall()
+    for r in rows:
+        age = now - r["ts"]
+        want4 = r["r4h"] is None and 4 * 3600 <= age < 8 * 3600
+        want24 = 24 * 3600 <= age < 36 * 3600
+        if not (want4 or want24):
+            continue
+        q = quote(r["symbol"])
+        if not q or q["status"] != "live" or not r["price"]:
+            continue
+        ret = q["price"] / r["price"] - 1
+        with db() as c:
+            if want4:
+                c.execute("UPDATE decisions SET r4h=? WHERE id=?", (ret, r["id"]))
+            if want24:
+                c.execute("UPDATE decisions SET r24h=? WHERE id=?", (ret, r["id"]))
+
+
 def gather_data(cand):
     """Data the Filter and Analyst need. None = could not be verified."""
     sym = cand["symbol"]
@@ -961,6 +1075,9 @@ def skeptic_review(cand, d, ind, score, rules):
     warn = sorted(codes & SEC_WARN)
     if warn:
         obj.append("8-K ต้องระวัง " + ", ".join(f"{c} {SEC_ITEMS[c]}" for c in warn))
+    tm = d.get("tm")
+    if tm and tm["trades"] >= TM_MIN_TRADES and (tm["avg_pct"] <= 0 or tm["win_rate"] < 0.4):
+        obj.append(f"ย้อนดู {tm['days']} วัน กฎนี้เฉลี่ย {tm['avg_pct']:+.2f}%/ไม้ ชนะ {tm['win_rate'] * 100:.0f}% ({tm['trades']} ไม้)")
     chg = cand.get("chg24")
     if chg is not None and chg > 8:
         obj.append(f"ขึ้นมาแล้ว {chg:+.1f}% ใน 24 ชม. เสี่ยงไล่ราคา")
@@ -1013,6 +1130,18 @@ def desk_talk(cand, d, ind, score, obj, veto, auto, px, talk):
     rsi = ind["rsi"] if ind else 50
     say("Charts", f"เข้า {px:.6g} · stop {px * (1 - STOP_LOSS_PCT):.6g} (-{STOP_LOSS_PCT:.0%}) · "
         f"เป้า {px * (1 + TARGET_PCT):.6g} (+{TARGET_PCT:.0%}) · EMA gap {gap * 100:+.2f}% · RSI {rsi:.0f}", sym)
+    tm = d.get("tm")
+    if tm is None:
+        say("Time Machine", "ดึงราคาย้อนหลังไม่ได้ จึงยังไม่มีผลย้อนดู", sym, "warn")
+    elif tm["trades"] == 0:
+        say("Time Machine", f"ย้อน {tm['days']} วัน กฎเดิมไม่เคยให้สัญญาณเข้าเลย (ถือเฉยๆ {tm['hold_pct']:+.1f}%)", sym)
+    else:
+        small = f" · ตัวอย่างน้อย ({tm['trades']} ไม้) เชื่อถือไม่ได้" if tm["trades"] < TM_MIN_TRADES else ""
+        good = tm["avg_pct"] > 0 and tm["win_rate"] >= 0.5
+        say("Time Machine", f"ย้อน {tm['days']} วัน ด้วยกฎเดิม: เข้า {tm['trades']} ครั้ง · ชนะ {tm['win_rate'] * 100:.0f}% · "
+            f"เฉลี่ย {tm['avg_pct']:+.2f}%/ไม้ (หักค่าธรรมเนียมแล้ว) · แย่สุด {tm['worst_pct']:+.1f}% · รวม {tm['total_pct']:+.1f}% "
+            f"· ถือเฉยๆ {tm['hold_pct']:+.1f}%{small} · ย้อนหลังไม่รับประกันอนาคต",
+            sym, "ok" if good and not small else "bad" if tm["avg_pct"] <= 0 and not small else "warn")
     if obj:
         say("Skeptic", "ค้านนะ: " + "; ".join(obj) + (" → VETO" if veto else " → ยังพอรับได้"), sym, "bad" if veto else "warn")
     else:
@@ -1121,7 +1250,9 @@ def run_cycle(cands=None, gather=None, ind_fn=None):
         q = quote(sym)
         d["news_read"] = news_read(sym)
         d["sec"] = sec_8k(sym) if cand["kind"] == "stock" else None
+        d["tm"] = time_machine(sym)
         objections, veto = skeptic_review(cand, d, ind, score, row["rules"])
+        record_decision(sym, "veto" if veto else "pass", q["price"], len(objections))
         desk_talk(cand, d, ind, score, objections, veto, auto, q["price"], n_rank < 5)
         if veto:
             row["stage"] = "skeptic"
@@ -1332,6 +1463,7 @@ def pipeline_loop():
         f"{data_note} · Scout/News/Sentiment/Charts/Skeptic ตามหน้าที่ · Risk ตั้ง stop ก่อนเข้า", tone="ok")
     while not STOP.is_set():
         _safe(run_cycle)
+        _safe(resolve_decisions)
         lp = live_params()
         STOP.wait(max(30, lp["pipeline_sec"]))
 
@@ -1439,6 +1571,31 @@ def desk():
             "cycle": PIPE["cycle"], "equity": pf["equity"], "pnl": pf["equity"] - pf["initial"],
             "closed": len(sells), "win_rate": (sum(1 for x in sells if x > 0) / len(sells)) if sells else None,
             "mode": lp["mode"], "mode_label": lp["label"]}
+
+
+@api.get("/skeptic")
+def skeptic_board():
+    out = {}
+    with db() as c:
+        for v in ("veto", "pass"):
+            rows = c.execute("SELECT r4h,r24h FROM decisions WHERE verdict=?", (v,)).fetchall()
+
+            def agg(key):
+                xs = [r[key] for r in rows if r[key] is not None]
+                return {"n": len(xs), "avg": (mean(xs) * 100) if xs else None, "win": (sum(1 for x in xs if x > 0) / len(xs)) if xs else None}
+            out[v] = {"total": len(rows), "r4h": agg("r4h"), "r24h": agg("r24h")}
+    a, b = out["veto"]["r4h"], out["pass"]["r4h"]
+    if min(a["n"], b["n"]) < SB_MIN_N:
+        out["note"] = f"ตัวอย่างยังน้อย (ต้องมีอย่างน้อย {SB_MIN_N} ไม้ต่อฝั่งที่ครบ 4 ชม.) ยังสรุปไม่ได้ว่า Skeptic ช่วยหรือไม่"
+        out["helps"] = None
+    else:
+        diff = b["avg"] - a["avg"]
+        out["helps"] = bool(diff > 0.1)
+        out["note"] = (f"ตัวที่ Skeptic บล็อกทำผลต่ำกว่าตัวที่ผ่าน {diff:+.2f} จุด (ใน 4 ชม.) → Skeptic ดูจะช่วยกรอง" if diff > 0.1 else
+                       f"ตัวที่ Skeptic บล็อกกลับทำผลดีกว่าตัวที่ผ่าน {-diff:+.2f} จุด → Skeptic อาจเข้มเกินไปหรือไม่ได้ช่วย" if diff < -0.1 else
+                       "ผลของตัวที่บล็อกกับตัวที่ผ่านแทบไม่ต่างกัน → Skeptic ยังไม่ได้ช่วยให้ดีขึ้นชัดเจน")
+    out["min_n"] = SB_MIN_N
+    return out
 
 
 @api.get("/newstone")

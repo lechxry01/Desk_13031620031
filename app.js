@@ -60,7 +60,7 @@ function renderMarket(items) {
 }
 
 const BOTC = {Chief: ["#f26a1b", "50% 0 50% 50%"], Scout: ["#f7931e", "42%"], News: ["#2b7bff", "14px"],
-  Sentiment: ["#e5384f", "38% 62% 45% 55%"], Charts: ["#8b5cf6", "50% 50% 40% 60%"], Skeptic: ["#8b95a5", "24px 24px 10px 10px"]};
+  Sentiment: ["#e5384f", "38% 62% 45% 55%"], Charts: ["#8b5cf6", "50% 50% 40% 60%"], "Time Machine": ["#4fb3a9", "50% 50% 50% 50% / 60% 60% 40% 40%"], Skeptic: ["#8b95a5", "24px 24px 10px 10px"]};
 const blob = (b, sm) => `<span class="blob${sm ? " sm" : ""}" style="--c:${(BOTC[b] || ["#888"])[0]};--r:${(BOTC[b] || [0, "50%"])[1]}"></span>`;
 
 function hms(s) { return Math.floor(s / 3600) + "h " + String(Math.floor(s % 3600 / 60)).padStart(2, "0") + "m"; }
@@ -90,6 +90,14 @@ function renderFilings(d) {
     <div class="traderow"><b>${esc(f.symbol)}</b><span>${f.labels.map(esc).join(" · ") || "ไม่ระบุรายการ"}</span>
     <span>${esc(f.date)} · <a href="${esc(f.url)}" target="_blank" rel="noopener">เปิดเอกสาร</a></span></div>`).join("")
     : (d.sec_on ? "" : '<small class="muted">เปิดดู 8-K ได้โดยตั้ง SEC_CONTACT ใน Render (ชื่อ + อีเมลของคุณ ตามกติกาของ SEC)</small>');
+}
+
+function renderBoard(d) {
+  const pct = x => (x == null ? "—" : (x >= 0 ? "+" : "") + x.toFixed(2) + "%");
+  const row = (label, v) => `<div class="traderow"><b>${label}</b><span>${v.total} ครั้ง · ครบ 4 ชม. ${v.r4h.n} · ครบ 24 ชม. ${v.r24h.n}</span>
+    <span>4 ชม. เฉลี่ย <strong>${pct(v.r4h.avg)}</strong> · 24 ชม. เฉลี่ย <strong>${pct(v.r24h.avg)}</strong></span></div>`;
+  $("board").innerHTML = row("🚫 บล็อก", d.veto) + row("✅ ผ่าน", d.pass) +
+    `<small class="muted">${esc(d.note)} · เป็นการเปลี่ยนของราคาดิบ ยังไม่หักค่าธรรมเนียม และกลุ่มทั้งสองเจอตลาดช่วงเดียวกัน</small>`;
 }
 
 function renderTone(d) {
@@ -225,7 +233,7 @@ async function refresh(manual = false) {
     const [m, pl, a, b, dk, e] = await Promise.all(calls);
     renderMarket(m.items); renderPipeline(pl); renderAccount(a); renderBot(b); renderDesk(dk);
     if (e) spark(e.points);
-    if (manual || toneTick++ % 6 === 0) api("/api/newstone").then(renderTone).catch(() => {});
+    if (manual || toneTick++ % 6 === 0) api("/api/newstone").then(renderTone).catch(() => {}); api("/api/skeptic").then(renderBoard).catch(() => {});
   } catch (err) { toast(err.message, "err"); }
   finally { busy = false; }
 }

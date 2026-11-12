@@ -28,12 +28,16 @@
   <div class="surv" id="surv"></div>
   <div class="bots" id="bots"></div>
   <div class="chat" id="chat"><div class="empty">รอทีมบอทเริ่มคุยรอบแรก…</div></div>
-  <small class="muted">บอททั้ง 6 คุยกันจากข้อมูลจริงของระบบ (ราคา/วอลุ่ม/ข่าว/อินดิเคเตอร์) · News อ่านพาดหัว+สรุปข่าว (ถ้าใส่ ANTHROPIC_API_KEY จะให้ Claude วิเคราะห์ ไม่งั้นใช้คีย์เวิร์ด) · Sentiment เป็น proxy ไม่ได้อ่านโซเชียล · Skeptic ค้านได้ ถ้าค้าน ≥ 3 ข้อจะบล็อกการเข้า · เงินจำลองเท่านั้น</small>
+  <small class="muted">บอททั้ง 7 คุยกันจากข้อมูลจริงของระบบ (ราคา/วอลุ่ม/ข่าว/อินดิเคเตอร์) · News อ่านพาดหัว+สรุปข่าว (ถ้าใส่ ANTHROPIC_API_KEY จะให้ Claude วิเคราะห์ ไม่งั้นใช้คีย์เวิร์ด) · Sentiment เป็น proxy ไม่ได้อ่านโซเชียล · Time Machine ย้อนดูผลของกฎเทคนิคเดิม 30 วัน (ไม่รวมข่าว/วอลุ่ม) · Skeptic ค้านได้ ถ้าค้านครบตามโหมดจะบล็อกการเข้า · เงินจำลองเท่านั้น</small>
 </section>
 <section class="panel">
   <div class="heading"><h2>📰 โทนข่าว (24 ชม.)</h2><span class="muted">−1 ลบ · +1 บวก</span></div>
   <div id="tone" class="table"><div class="empty">ยังไม่มีข้อมูล รอบอทอ่านข่าวของตัวที่ผ่านด่านแรก</div></div>
   <div id="filings" class="table"></div>
+</section>
+<section class="panel">
+  <div class="heading"><h2>⚖️ Skeptic Scoreboard</h2><span class="muted">ผลจริงหลังบล็อก/ผ่าน</span></div>
+  <div id="board" class="table"><div class="empty">ยังไม่มีข้อมูล · ต้องรอครบ 4 ชม. หลังบอทตัดสินแต่ละตัว</div></div>
 </section>
 <section class="panel">
   <div class="heading"><h2>🤖 Auto Trading</h2>
